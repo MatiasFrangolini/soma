@@ -1,17 +1,21 @@
 {
-  "version": "0.3.1",
-  "description": "Lightweight native Windows runner with an agent-first JSON CLI",
+  "version": "0.3.2",
+  "description": "Lightweight native Windows runner with an optional JSON CLI",
   "homepage": "https://github.com/MatiasFrangolini/soma",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/MatiasFrangolini/soma/releases/download/v0.3.1/Soma-0.3.1-windows-x64.zip",
-      "hash": "a5c03a728df6afe5ec74f806d9dde0e50694bc7a8c6d474fc5de6e26ebd5915a"
+      "url": "https://github.com/MatiasFrangolini/soma/releases/download/v0.3.2/Soma-0.3.2-windows-x64.zip",
+      "hash": "3be38c060327e37216ac388f61e97a546f69dd6e29431994a1926d4f7fadd893"
     }
   },
   "bin": [
     "soma-cli.exe",
-    "Soma.exe"
+    "Soma.exe",
+    [
+      "Update-Soma.ps1",
+      "soma-update"
+    ]
   ],
   "shortcuts": [
     [
@@ -33,7 +37,7 @@
     "    if ($state -ne 'closed') { throw 'Close Soma before updating or uninstalling. Use soma-cli close for an orderly shutdown.' }",
     "}"
   ],
-  "notes": "Personal configuration and logs stay in USERPROFILE\\.soma. Close Soma before updating. Java is required only for Java projects.",
+  "notes": "Personal configuration and logs stay in USERPROFILE\\.soma. Close Soma and run soma-update to update. Java is required only for Java projects. No AI tools are required.",
   "checkver": {
     "github": "https://github.com/MatiasFrangolini/soma"
   },

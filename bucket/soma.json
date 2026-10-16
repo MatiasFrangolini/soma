@@ -1,0 +1,47 @@
+{
+  "version": "0.3.0",
+  "description": "Lightweight native Windows runner with an agent-first JSON CLI",
+  "homepage": "https://github.com/MatiasFrangolini/soma",
+  "license": "MIT",
+  "architecture": {
+    "64bit": {
+      "url": "https://github.com/MatiasFrangolini/soma/releases/download/v0.3.0/Soma-0.3.0-windows-x64.zip",
+      "hash": "e1af61f39428d008218aff8d9524c8a7a112bc8b4422f1cc5a6604f802668173"
+    }
+  },
+  "bin": [
+    "soma-cli.exe",
+    "Soma.exe"
+  ],
+  "shortcuts": [
+    [
+      "Soma.exe",
+      "Soma"
+    ]
+  ],
+  "pre_install": [
+    "$oldCli = Join-Path (appdir $app $global) 'current\\soma-cli.exe'",
+    "if (Test-Path -LiteralPath $oldCli) {",
+    "    $state = (& $oldCli status | ConvertFrom-Json).status.state",
+    "    if ($state -ne 'closed') { throw 'Close Soma before updating or uninstalling. Use soma-cli close for an orderly shutdown.' }",
+    "}"
+  ],
+  "pre_uninstall": [
+    "$oldCli = Join-Path (appdir $app $global) 'current\\soma-cli.exe'",
+    "if (Test-Path -LiteralPath $oldCli) {",
+    "    $state = (& $oldCli status | ConvertFrom-Json).status.state",
+    "    if ($state -ne 'closed') { throw 'Close Soma before updating or uninstalling. Use soma-cli close for an orderly shutdown.' }",
+    "}"
+  ],
+  "notes": "Personal configuration and logs stay in LOCALAPPDATA\\Soma. Close Soma before updating. Java is required only for Java projects.",
+  "checkver": {
+    "github": "https://github.com/MatiasFrangolini/soma"
+  },
+  "autoupdate": {
+    "architecture": {
+      "64bit": {
+        "url": "https://github.com/MatiasFrangolini/soma/releases/download/v$version/Soma-$version-windows-x64.zip"
+      }
+    }
+  }
+}

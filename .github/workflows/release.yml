@@ -61,6 +61,16 @@ jobs:
       - name: Independent Maven job contracts
         shell: pwsh
         run: ./tests/jobs.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-jobs-qa') -Jdk $env:JAVA_HOME_21_X64
+      - name: Preserve native verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: soma-native-verification
+          path: |
+            ${{ runner.temp }}/soma-targets-qa/targets-verification.json
+            ${{ runner.temp }}/soma-targets-qa/targets-failure.json
+            ${{ runner.temp }}/soma-targets-qa/targets-failure.log
+            ${{ runner.temp }}/soma-jobs-qa/jobs-verification.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: soma-windows-release

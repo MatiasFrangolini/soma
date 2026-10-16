@@ -60,10 +60,10 @@ try{
     $null=Invoke-JobCli @('show')
     $owner=Get-CimInstance Win32_Process -Filter "Name='Soma.exe'"|Where-Object CommandLine -like "*$data*"|Select-Object -First 1
     Assert ($null -ne $owner) 'Submitting jobs uses the existing native owner'
-    $first=Submit 'sleep'
+    $first=Submit 'sleep' 'test' @('--define=private.canary=soma-private-argument-fixture')
     Assert ($first.ok -and $first.job_id -and $first.participant_id) 'Submit returns a job and a participant'
     Wait-Started $first.job_id
-    $same=Submit 'sleep'
+    $same=Submit 'sleep' 'test' @('--define=private.canary=soma-private-argument-fixture')
     Assert ($same.ok -and $same.deduplicated -and $same.job_id -eq $first.job_id -and $same.participant_id -ne $first.participant_id) 'Two agents share one active Maven execution with independent participation'
     $queued=Submit 'pass'
     Assert ((Job $queued.job_id).job.state -eq 'queued') 'Another Maven request queues behind the active job'
@@ -75,6 +75,7 @@ try{
     Assert ($done.Code -eq 0 -and $done.Value.job.evidence.tests -eq 3 -and $done.Value.job.evidence.executed -eq 2 -and $done.Value.job.evidence.skipped -eq 1) 'Real Surefire evidence reports executed and explicitly skipped tests'
     Assert (@(Get-Content -LiteralPath (Join-Path $fixture 'invocations.txt')).Count -eq 1) 'Joined and cancelled requests did not execute JUnit again'
     $timing=$done.Value.job.timings
+    Assert (-not ($done.Value.job|ConvertTo-Json -Depth 12 -Compress).Contains('soma-private-argument-fixture')) 'Long-form Maven property values stay out of requested and effective JSON metadata'
     Assert ($null -ne $timing.resource_wait_ms -and $timing.maven_ms -gt 12000 -and $timing.total_ms -ge $timing.maven_ms) 'JSON separates measured preparation, queue, adapter waiting and Maven wall time'
     $again=Submit 'pass';$againDone=Wait-Job $again.job_id
     Assert ($again.job_id -ne $same.job_id -and $againDone.Code -eq 0 -and @(Get-Content -LiteralPath (Join-Path $fixture 'invocations.txt')).Count -eq 2) 'A finished green result is not automatically reused'

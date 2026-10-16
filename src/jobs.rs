@@ -201,6 +201,23 @@ fn safe_args(args: &[String]) -> Vec<String> {
                     return format!("{key}=<redacted>");
                 }
             }
+            if let Some(raw) = a.strip_prefix("--define=") {
+                let (key, _) = raw.split_once('=').unwrap_or((raw, ""));
+                if matches!(key, "test" | "it.test") {
+                    return a.clone();
+                }
+                return format!("--define={key}=<redacted>");
+            }
+            for prefix in [
+                "--encrypt-password=",
+                "--encrypt-master-password=",
+                "-emp",
+                "-ep",
+            ] {
+                if a.starts_with(prefix) && a.len() > prefix.len() {
+                    return format!("{prefix}<redacted>");
+                }
+            }
             a.clone()
         })
         .collect()
@@ -926,6 +943,13 @@ impl Jobs {
                 {
                     detail.message = detail.message.replace(value, "<redacted>");
                 }
+            }
+            if detail.message.len() > 2048 {
+                let mut end = 2048;
+                while !detail.message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                detail.message.truncate(end);
             }
         }
         let changed = crate::jobs::plan(&self.store, request)

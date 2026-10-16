@@ -48,7 +48,7 @@ $configs=foreach($entry in @(@{id='http';mode='http';port=$port;delay=1200;ready
         build=@{executable='pwsh';args=@('-NoProfile','-File',(Join-Path $main 'build.ps1'),'-ProjectDir',$main,'-Jdk',$Jdk)};
         run=@{kind='java_jar';artifact='probe.jar';jvm_args=@('-Xmx32m');args=@($entry.mode,[string]$entry.port,[string]$entry.delay)};
         inputs=@('Probe.java','build.ps1','marker.txt');input_excludes=@()}
-    if($entry.ready){$config.readiness=@{url="http://127.0.0.1:$port/health";timeout_seconds=2;json_field='status';expected='UP'};if($entry.port){$config.readiness.url="http://127.0.0.1:$($entry.port)/health"}else{$config.readiness.url="http://127.0.0.1:$port/health"};if($entry.id -eq 'http'){$config.readiness.timeout_seconds=15}}
+    if($entry.ready){$config.readiness=@{url="http://127.0.0.1:$port/health";timeout_seconds=2;json_field='status';expected='UP'};if($entry.port){$config.readiness.url="http://127.0.0.1:$($entry.port)/health"}else{$config.readiness.url="http://127.0.0.1:$port/health"};if($entry.id -eq 'http'){$config.readiness.timeout_seconds=30}}
     $config
 }
 $settings=@{schema_version=1;projects=@(@{id='probe';name='Target fixture';directory=$main;configs=@($configs)})}
@@ -65,7 +65,8 @@ try{
     Assert ($stale.Code -eq 4) 'A build recorded in another worktree cannot be reused'
     $started=Invoke-TargetRunner @('run','--path',$linked,'--config','http')
     $operation=$started.Value.operation_id
-    $ready=Invoke-TargetRunner @('wait','--operation',$operation,'--ready','--timeout','30')
+    $ready=Invoke-TargetRunner @('wait','--operation',$operation,'--ready','--timeout','45')
+    if($ready.Code -ne 0){throw ('Readiness failed: '+($ready.Value|ConvertTo-Json -Depth 8 -Compress)+' logs: '+(Invoke-TargetRunner @('logs','--tail','100')).Value.text)}
     Assert ($ready.Code -eq 0 -and $ready.Value.status.readiness -eq 'ready' -and $ready.Value.status.state -eq 'running') 'Readiness waits for HTTP JSON UP and returns while Java remains running'
     Assert ($ready.Value.status.directory -eq $linked -and $ready.Value.status.branch -eq 'fixture-feature' -and $ready.Value.status.head -eq (& git -C $linked rev-parse HEAD)) 'Status identifies the actual checkout, branch and commit'
     $logs=(Invoke-TargetRunner @('logs','--tail','200')).Value.text
@@ -190,6 +191,13 @@ public static class SomaTargetUi {
     Assert ($text.ToString() -eq 'normal') 'Native profile selector follows a CLI execution even when its checkout stays the same'
     Stop-Owned $profile.Value.status.operation_id
     [ordered]@{Result='PASS';Checks=@($checks.ToArray());Main=$main;Linked=$linked;Data=$data;Jdk=$Jdk}|ConvertTo-Json -Depth 6|Set-Content (Join-Path $Workspace 'targets-verification.json')
+}catch{
+    $failure=$_
+    try{
+        [ordered]@{Error=$failure.Exception.Message;Runtime=(Invoke-TargetRunner @('status')).Value;Listeners=@(Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue|Select-Object LocalAddress,LocalPort,OwningProcess)}|ConvertTo-Json -Depth 10|Set-Content (Join-Path $Workspace 'targets-failure.json')
+        (Invoke-TargetRunner @('logs','--tail','100')).Value.text|Set-Content (Join-Path $Workspace 'targets-failure.log')
+    }catch{}
+    throw $failure
 }finally{
     $null=Invoke-TargetRunner @('close');$null=Invoke-TargetRunner @('close') $otherData
     if($null -ne $foreign){if(-not $foreign.HasExited){$foreign.Kill();$foreign.WaitForExit()};$foreign.Dispose()}

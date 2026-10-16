@@ -1,12 +1,12 @@
 {
-  "version": "0.4.1",
+  "version": "0.5.1",
   "description": "Lightweight native Windows runner with an optional JSON CLI",
   "homepage": "https://github.com/MatiasFrangolini/soma",
   "license": "MIT",
   "architecture": {
     "64bit": {
-      "url": "https://github.com/MatiasFrangolini/soma/releases/download/v0.4.1/Soma-0.4.1-windows-x64.zip",
-      "hash": "92b00681f1f6606148bb2d7c67bf527c097eff91510f5ab38d2940a7e32e1250"
+      "url": "https://github.com/MatiasFrangolini/soma/releases/download/v0.5.1/Soma-0.5.1-windows-x64.zip",
+      "hash": "30254fc27974e88735ba7446918a0bd77eb399f73c7adf2114e1deb3217597c6"
     }
   },
   "bin": [

@@ -1,0 +1,25 @@
+#include <windows.h>
+101 ICON "soma.ico"
+1 VERSIONINFO
+FILEVERSION @VERSION_COMMAS@
+PRODUCTVERSION @VERSION_COMMAS@
+FILEOS VOS_NT_WINDOWS32
+FILETYPE VFT_APP
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904B0"
+  BEGIN
+   VALUE "FileDescription", "Soma - local application runner\0"
+   VALUE "InternalName", "Soma\0"
+   VALUE "OriginalFilename", "Soma.exe\0"
+   VALUE "ProductName", "Soma\0"
+   VALUE "FileVersion", "@VERSION@\0"
+   VALUE "ProductVersion", "@VERSION@\0"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x0409, 1200
+ END
+END

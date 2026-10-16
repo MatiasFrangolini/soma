@@ -1,0 +1,95 @@
+name: Windows build and release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: soma-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: msys2/setup-msys2@ec48f7c5447b3140e2b088413ae3a55687bccb6e # v2
+        id: msys
+        with:
+          msystem: MINGW64
+          update: false
+          install: mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+      - name: Build
+        shell: pwsh
+        env:
+          MSYS2_ROOT: ${{ steps.msys.outputs.msys2-location }}
+        run: |
+          $bin = Join-Path $env:MSYS2_ROOT 'mingw64/bin'
+          $env:PATH = $bin + ';' + $env:PATH
+          $env:WINDRES = Join-Path $bin 'windres.exe'
+          rustup target add x86_64-pc-windows-gnu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build --locked --release --jobs 1 --target x86_64-pc-windows-gnu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($exe in @('Soma.exe', 'soma-cli.exe')) {
+            $imports = & (Join-Path $bin 'objdump.exe') -p (Join-Path './target/x86_64-pc-windows-gnu/release' $exe)
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            if ($imports -match 'DLL Name:.*(libgcc|libstdc|libwinpthread|msys-)') { throw 'Unexpected toolchain runtime DLL dependency' }
+          }
+      - name: Package
+        shell: pwsh
+        env:
+          REPOSITORY_URL: https://github.com/${{ github.repository }}
+          SOURCE_REF: ${{ github.ref }}
+        run: |
+          $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([0-9.]+)"').Groups[1].Value
+          if ($env:SOURCE_REF.StartsWith('refs/tags/') -and $env:SOURCE_REF -ne "refs/tags/v$version") { throw 'Tag and Cargo version differ' }
+          ./scripts/Package.ps1 -BinaryDirectory ./target/x86_64-pc-windows-gnu/release -RepositoryUrl $env:REPOSITORY_URL
+      - name: Process contracts
+        shell: pwsh
+        run: ./tests/verify.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-process-qa') -Jdk $env:JAVA_HOME_21_X64
+      - name: Distribution contracts
+        shell: pwsh
+        run: ./tests/distribution.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-distribution-qa') -Package (Get-ChildItem ./dist/Soma-*-windows-x64.zip).FullName
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: soma-windows-release
+          path: |
+            dist/*.zip
+            dist/SHA256SUMS
+            dist/soma.json
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: main
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: soma-windows-release
+          path: dist
+      - name: Publish release and update Scoop
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          gh release create "$TAG" dist/*.zip dist/SHA256SUMS --repo "$REPOSITORY" --verify-tag --title "Soma $TAG" --generate-notes --draft
+          gh release edit "$TAG" --repo "$REPOSITORY" --draft=false --latest
+          mkdir -p bucket
+          cp dist/soma.json bucket/soma.json
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add bucket/soma.json
+          if ! git diff --cached --quiet; then
+            git commit -m "Update Scoop manifest for $TAG"
+            git push origin HEAD:main
+          fi

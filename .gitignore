@@ -1,0 +1,8 @@
+/target/
+/dist/
+/qa/
+/Soma-data/
+/RunLocal-data/
+*.log
+.env
+.env.*

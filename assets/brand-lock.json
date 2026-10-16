@@ -1,0 +1,17 @@
+{
+  "brand_name": "Soma",
+  "brand_mode": "create-identity",
+  "locked_constraints": ["Nombre elegido por el usuario", "Windows nativo y consumo reducido", "Una alternativa debe combinar taza y vapor con forma de llama", "Conservar controles y tipografías existentes", "Para la S actual, conservar las proporciones y curvas de concepto-generado-v2.png sin ensanchamiento horizontal"],
+  "official_logos": [],
+  "inventory": "No había logo propio ni recursos de icono; la ventana usaba IDI_APPLICATION del sistema.",
+  "sources": ["Solicitud del usuario del 16 de octubre de 2026", "Corrección del usuario: prefiere una S, rechaza los primeros dibujos y solicita explorar con imagegen antes de vectorizar", "Ajuste del usuario: prefiere las proporciones y curvas de la S generada y pide quitar el ensanchamiento del SVG", "src/ui.rs"],
+  "neutral_colors": ["#161A20", "#111821", "#F0E9DE"],
+  "accent_colors": ["#F6A55B", "#A8DCC8"],
+  "typography": ["Segoe UI", "Consolas"],
+  "iconography": "Siluetas simples, curvas limpias, alto contraste, sin texto dentro del icono",
+  "logo_clearspace": "Aproximadamente 8 unidades sobre un viewBox de 64",
+  "logo_minimum_size": "Objetivo 16 px, sujeto a verificación visual",
+  "flexible_constraints": ["Los cuatro conceptos iniciales fueron rechazados", "Nueva dirección: monograma S con curvas refinadas y sensación de vapor", "Exploración raster con imagegen y reconstrucción SVG simple", "Vapor aplicado como propuesta revisable", "Colores de los conceptos propuestos"],
+  "forbidden_treatments": ["Animaciones", "Texturas", "Fuentes descargadas", "Webview o biblioteca gráfica adicional en runtime"],
+  "dependency_notes": ["SVG editable para cada opción", "PNG e ICO son exportaciones", "Vapor tiene un solo trazado Bézier y fondo nativo", "La imagen de imagegen es referencia de diseño y no se carga al ejecutar", "Solo el ICO seleccionado se incrusta en Soma.exe"]
+}

@@ -4,7 +4,7 @@ Runner Windows nativo en Rust. GUI y CLI comparten una única autoridad de ejecu
 
 `model.rs` posee configuración, entorno y vigencia de builds; `engine.rs`, operaciones, logs y árboles de procesos; `worker.rs`, consola y Ctrl+C; `ipc.rs`, protocolo; `ui.rs`, controles Win32. Conservá las colas acotadas y el control de reentrada del visor.
 
-La precedencia de variables es sistema → `.env` → overrides explícitos. Los datos personales viven en `%LOCALAPPDATA%\Soma`, salvo configuración portable existente, `SOMA_HOME` o `--data-dir`. Conservá entradas ajenas al editar `projects.json`; ejecutá `validate` después.
+La precedencia de variables es sistema → `.env` → overrides explícitos. Los datos personales viven en `%USERPROFILE%\.soma`, salvo configuración portable existente, `SOMA_HOME` o `--data-dir`. Conservá entradas ajenas al editar `projects.json`; ejecutá `validate` después.
 
 Para validar cambios de ejecución, `tests/verify.ps1` ejercita la CLI con JVMs reales descartables. `tests/distribution.ps1` verifica almacenamiento entre versiones y el ZIP público. Respetá los controles de recursos de la máquina local; CI compila y prueba de forma secuencial.
 

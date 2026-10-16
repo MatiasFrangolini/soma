@@ -19,7 +19,7 @@ Para actualizar, cerrá Soma y ejecutá:
 scoop update soma
 ```
 
-Para desinstalar: `scoop uninstall soma`. Tus datos se conservan en `%LOCALAPPDATA%\Soma`.
+Para desinstalar: `scoop uninstall soma`. Tus datos se conservan en `%USERPROFILE%\.soma`.
 
 Soma no requiere Rust, IntelliJ, .NET ni Java para abrir su interfaz. Java/JDK y Maven son necesarios únicamente para los proyectos que los usan. Windows Terminal es opcional para abrir una terminal externa.
 
@@ -37,7 +37,7 @@ Cerrar Soma detiene la aplicación que inició. Solo hay una ejecución a la vez
 
 Cada configuración admite directorio, ejecutable/argumentos, build opcional, `.env`, variables explícitas y selección de JDK. El preset Java añade JAR, argumentos JVM, perfiles Spring y YAML externo. La precedencia es entorno del sistema → `.env` del repo → overrides explícitos. El archivo `.env` se lee al iniciar cada ejecución.
 
-Los datos están en `%LOCALAPPDATA%\Soma`. `--data-dir` y `SOMA_HOME` permiten otra ubicación; se conserva compatibilidad con `RUNLOCAL_HOME` y carpetas portables `Soma-data`/`RunLocal-data` existentes junto al EXE. El bundle público no incluye configuraciones ni logs de ningún usuario.
+Los datos están en `%USERPROFILE%\.soma`, una ubicación estable al ejecutar desde Inicio o desde agentes empaquetados en MSIX. En el primer inicio se recuperan automáticamente la configuración y los logs de la versión 0.3.0 en `%LOCALAPPDATA%\Soma`, conservando los originales. `--data-dir` y `SOMA_HOME` permiten otra ubicación; se conserva compatibilidad con `RUNLOCAL_HOME` y carpetas portables `Soma-data`/`RunLocal-data` existentes junto al EXE. El bundle público no incluye configuraciones ni logs de ningún usuario.
 
 ## CLI para agentes
 

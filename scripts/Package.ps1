@@ -25,7 +25,7 @@ $guard=@(
     '    if ($state -ne ''closed'') { throw ''Close Soma before updating or uninstalling. Use soma-cli close for an orderly shutdown.'' }',
     '}'
 )
-$manifest=[ordered]@{version=$version;description='Lightweight native Windows runner with an agent-first JSON CLI';homepage=$RepositoryUrl;license='MIT';architecture=@{'64bit'=@{url="$RepositoryUrl/releases/download/v$version/$filename";hash=$hash}};bin=@('soma-cli.exe','Soma.exe');shortcuts=@(,@('Soma.exe','Soma'));pre_install=$guard;pre_uninstall=$guard;notes='Personal configuration and logs stay in LOCALAPPDATA\Soma. Close Soma before updating. Java is required only for Java projects.';checkver=@{github=$RepositoryUrl};autoupdate=@{architecture=@{'64bit'=@{url=($RepositoryUrl+'/releases/download/v$version/Soma-$version-windows-x64.zip')}}}}
+$manifest=[ordered]@{version=$version;description='Lightweight native Windows runner with an agent-first JSON CLI';homepage=$RepositoryUrl;license='MIT';architecture=@{'64bit'=@{url="$RepositoryUrl/releases/download/v$version/$filename";hash=$hash}};bin=@('soma-cli.exe','Soma.exe');shortcuts=@(,@('Soma.exe','Soma'));pre_install=$guard;pre_uninstall=$guard;notes='Personal configuration and logs stay in USERPROFILE\.soma. Close Soma before updating. Java is required only for Java projects.';checkver=@{github=$RepositoryUrl};autoupdate=@{architecture=@{'64bit'=@{url=($RepositoryUrl+'/releases/download/v$version/Soma-$version-windows-x64.zip')}}}}
 $manifest|ConvertTo-Json -Depth 9|Set-Content -LiteralPath (Join-Path $output 'soma.json') -Encoding utf8NoBOM
 if(-not $stage.StartsWith($output+[IO.Path]::DirectorySeparatorChar,[StringComparison]::OrdinalIgnoreCase)){throw 'Unsafe stage cleanup'}
 Remove-Item -LiteralPath $stage -Recurse -Force

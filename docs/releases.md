@@ -12,6 +12,6 @@ El script sube `main` y el tag correspondiente. GitHub Actions compila Windows x
 
 Si una ejecución falla, resolvé su causa y publicá una versión nueva. No sobrescribas binarios de una versión que otras personas ya instalaron. La comprobación local de un bundle se hace con `scripts/Package.ps1 -BinaryDirectory RUTA` y `tests/distribution.ps1`; no sustituye la ejecución de CI en el runner Windows.
 
-Los usuarios cierran Soma y ejecutan `scoop update soma`. Scoop comprueba el hash, conserva las versiones según sus reglas y actualiza los shims y el acceso del menú Inicio. Los proyectos, logs y parámetros JVM están en `%LOCALAPPDATA%\Soma` y no forman parte del ZIP. `scoop uninstall soma` retira la app y conserva esos datos.
+Los usuarios cierran Soma y ejecutan `scoop update soma`. Scoop comprueba el hash, conserva las versiones según sus reglas y actualiza los shims y el acceso del menú Inicio. Los proyectos, logs y parámetros JVM están en `%USERPROFILE%\.soma` y no forman parte del ZIP. `scoop uninstall soma` retira la app y conserva esos datos.
 
 El preset Maven general usa el wrapper del proyecto y el objetivo `package`. Un `maven_adapter` explícito puede reemplazarlo para políticas locales. No distribuyas adaptadores de una PC ni ajustes de heap específicos de un backend como valores universales.

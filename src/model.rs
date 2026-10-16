@@ -104,9 +104,9 @@ impl Store {
                 } else if legacy.join("projects.json").is_file() {
                     legacy
                 } else {
-                    std::env::var_os("LOCALAPPDATA")
+                    std::env::var_os("USERPROFILE")
                         .map(PathBuf::from)
-                        .map(|p| p.join("Soma"))
+                        .map(|p| p.join(".soma"))
                         .unwrap_or(home)
                 }
             });
@@ -122,6 +122,53 @@ impl Store {
     pub fn initialize(&self) -> Result<()> {
         fs::create_dir_all(self.home.join("logs")).map_err(|e| e.to_string())?;
         fs::create_dir_all(self.home.join("builds")).map_err(|e| e.to_string())?;
+        let installed_home =
+            std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".soma"));
+        if installed_home.as_ref() == Some(&self.home) && !self.path().exists() {
+            if let Some(legacy) =
+                std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("Soma"))
+            {
+                if legacy.join("projects.json").is_file() {
+                    for name in ["current.log", "previous-1.log", "previous-2.log"] {
+                        let source = legacy.join("logs").join(name);
+                        if source.is_file() {
+                            fs::copy(source, self.home.join("logs").join(name))
+                                .map_err(|e| e.to_string())?;
+                        }
+                    }
+                    let mut settings: Settings = serde_json::from_slice(
+                        &fs::read(legacy.join("projects.json")).map_err(|e| e.to_string())?,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    if let Some(adapter) = settings.maven_adapter.clone() {
+                        let source = PathBuf::from(&adapter);
+                        let legacy_plain =
+                            plain(fs::canonicalize(&legacy).unwrap_or(legacy.clone()));
+                        let source_plain =
+                            plain(fs::canonicalize(&source).unwrap_or(source.clone()));
+                        if source_plain.parent() == Some(legacy_plain.as_path()) && source.is_file()
+                        {
+                            let target = self.home.join(source.file_name().unwrap());
+                            fs::copy(&source, &target).map_err(|e| e.to_string())?;
+                            let replacement = target.to_string_lossy().to_string();
+                            settings.maven_adapter = Some(replacement.clone());
+                            for project in &mut settings.projects {
+                                for config in &mut project.configs {
+                                    if let Some(build) = &mut config.build {
+                                        for arg in &mut build.args {
+                                            if arg == &adapter {
+                                                *arg = replacement.clone();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    self.save(&settings)?;
+                }
+            }
+        }
         if !self.path().exists() {
             self.save(&Settings {
                 schema_version: 1,

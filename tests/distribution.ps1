@@ -5,9 +5,9 @@ $root=Split-Path -Parent $PSScriptRoot
 New-Item -ItemType Directory -Path $Workspace -Force|Out-Null
 $checks=[Collections.Generic.List[string]]::new()
 function Assert([bool]$Condition,[string]$Description){if(-not $Condition){throw ('FAIL: '+$Description)};$checks.Add($Description);Write-Output ('PASS: '+$Description)}
-function Invoke-SomaCli([string]$Exe,[string[]]$Arguments){
+function Invoke-SomaCli([string]$Exe,[string[]]$Arguments,[string]$ProfileDirectory=(Join-Path $Workspace 'profile')){
     $info=[Diagnostics.ProcessStartInfo]::new($Exe);$info.UseShellExecute=$false;$info.CreateNoWindow=$true;$info.RedirectStandardOutput=$true;$info.RedirectStandardError=$true
-    $info.Environment['LOCALAPPDATA']=Join-Path $Workspace 'profile';$null=$info.Environment.Remove('SOMA_HOME');$null=$info.Environment.Remove('RUNLOCAL_HOME')
+    $info.Environment['USERPROFILE']=$ProfileDirectory;$info.Environment['LOCALAPPDATA']=Join-Path $ProfileDirectory 'AppData/Local';$null=$info.Environment.Remove('SOMA_HOME');$null=$info.Environment.Remove('RUNLOCAL_HOME')
     foreach($argument in $Arguments){$info.ArgumentList.Add($argument)}
     $p=[Diagnostics.Process]::Start($info)
     try{$raw=$p.StandardOutput.ReadToEnd();$errorText=$p.StandardError.ReadToEnd();$p.WaitForExit();if($p.ExitCode -ne 0){throw ($raw+$errorText)};return $raw|ConvertFrom-Json}finally{$p.Dispose()}
@@ -15,13 +15,31 @@ function Invoke-SomaCli([string]$Exe,[string[]]$Arguments){
 $one=Join-Path $Workspace 'version-one';$two=Join-Path $Workspace 'version-two'
 foreach($path in @($one,$two)){Expand-Archive -LiteralPath $Package -DestinationPath $path -Force}
 $first=Join-Path $one 'soma-cli.exe';$second=Join-Path $two 'soma-cli.exe'
-$expected=Join-Path $Workspace 'profile/Soma/projects.json'
-Assert ((Invoke-SomaCli $first @('config-path')).path -eq $expected) 'Fresh installations use per-user LocalAppData, not the version folder'
+$expected=Join-Path $Workspace 'profile/.soma/projects.json'
+Assert ((Invoke-SomaCli $first @('config-path')).path -eq $expected) 'Fresh installations use the stable user profile directory, outside version folders and AppData package redirection'
 $project=Join-Path $Workspace 'a project';New-Item -ItemType Directory -Path $project -Force|Out-Null
 $added=Invoke-SomaCli $first @('add','--path',$project)
 $listed=Invoke-SomaCli $second @('projects')
 Assert ($listed.projects[0].id -eq $added.project) 'Another installed version sees existing personal projects'
 Assert (-not (Test-Path -LiteralPath (Join-Path $one 'Soma-data'))) 'The executable folder stays free of personal data'
+$migratedProfile=Join-Path $Workspace 'migrated-profile'
+$legacyAppData=Join-Path $migratedProfile 'AppData/Local/Soma'
+New-Item -ItemType Directory -Path (Join-Path $legacyAppData 'logs') -Force|Out-Null
+Copy-Item -LiteralPath $expected -Destination (Join-Path $legacyAppData 'projects.json')
+$legacyAdapter=Join-Path $legacyAppData 'build-maven.ps1'
+Set-Content -LiteralPath $legacyAdapter -Value 'Write-Output migration-fixture'
+$legacySettings=Get-Content -LiteralPath (Join-Path $legacyAppData 'projects.json') -Raw|ConvertFrom-Json
+$legacySettings|Add-Member -NotePropertyName maven_adapter -NotePropertyValue $legacyAdapter -Force
+$legacySettings|ConvertTo-Json -Depth 20|Set-Content -LiteralPath (Join-Path $legacyAppData 'projects.json')
+Set-Content -LiteralPath (Join-Path $legacyAppData 'logs/current.log') -Value 'LEGACY HISTORY'
+$legacyHash=(Get-FileHash -LiteralPath (Join-Path $legacyAppData 'projects.json')).Hash
+$migrated=Invoke-SomaCli $second @('projects') $migratedProfile
+Assert ($migrated.projects[0].id -eq $added.project) 'The 0.3.0 AppData configuration migrates to the stable profile on first use'
+$migratedSettings=Get-Content -LiteralPath (Join-Path $migratedProfile '.soma/projects.json') -Raw|ConvertFrom-Json
+Assert ($migratedSettings.maven_adapter -eq (Join-Path $migratedProfile '.soma/build-maven.ps1') -and (Test-Path -LiteralPath $migratedSettings.maven_adapter)) 'A private Maven adapter is copied and repointed outside AppData redirection'
+$migratedLogs=Invoke-SomaCli $second @('logs') $migratedProfile
+Assert ($migratedLogs.text.Contains('LEGACY HISTORY')) 'Existing rotating logs are preserved during AppData migration'
+Assert ((Get-FileHash -LiteralPath (Join-Path $legacyAppData 'projects.json')).Hash -eq $legacyHash) 'Migration keeps the original AppData configuration intact'
 $custom=Join-Path $Workspace 'custom'
 Assert ((Invoke-SomaCli $second @('config-path','--data-dir',$custom)).path -eq (Join-Path $custom 'projects.json')) 'Explicit data-dir still overrides the installed default'
 $legacy=Join-Path $one 'RunLocal-data';New-Item -ItemType Directory -Path $legacy|Out-Null

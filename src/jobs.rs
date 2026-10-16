@@ -126,6 +126,7 @@ pub struct Request {
 #[derive(Clone)]
 struct Plan {
     project: Project,
+    modules: Vec<PathBuf>,
     environment: BTreeMap<String, String>,
     wrapper: String,
     args: Vec<String>,
@@ -217,7 +218,7 @@ fn adapter_digest(adapter: &Option<CommandSpec>) -> Result<String> {
     }
     Ok(format!("{:x}", digest.finalize()))
 }
-fn validate_reactor(directory: &Path) -> Result<()> {
+fn validate_reactor(directory: &Path) -> Result<Vec<PathBuf>> {
     // Every declared reactor module must share the checkout protected by the lease.
     use quick_xml::{events::Event, Reader};
     use std::io::{BufReader, Read};
@@ -269,7 +270,10 @@ fn validate_reactor(directory: &Path) -> Result<()> {
             buffer.clear();
         }
     }
-    Ok(())
+    Ok(seen
+        .into_iter()
+        .map(|pom| model::plain(pom.parent().unwrap().to_path_buf()))
+        .collect())
 }
 fn plan(store: &Store, request: &Request) -> Result<Plan> {
     if !matches!(request.kind.as_str(), "test" | "build") {
@@ -303,7 +307,7 @@ fn plan(store: &Store, request: &Request) -> Result<Plan> {
             "Esta entrega ejecuta el pom.xml del checkout elegido; no admite -f/--file".into(),
         );
     }
-    validate_reactor(&directory)?;
+    let modules = validate_reactor(&directory)?;
     let project_id = store.project_at(&directory)?;
     let settings = store.load()?;
     let mut project = settings
@@ -362,6 +366,7 @@ fn plan(store: &Store, request: &Request) -> Result<Plan> {
     }
     Ok(Plan {
         project,
+        modules,
         environment,
         wrapper,
         args,
@@ -910,7 +915,7 @@ impl Jobs {
         }
         let code = result?;
         let clock = Instant::now();
-        let mut evidence = reports::collect(&plan.project.directory, id, request.kind == "test");
+        let mut evidence = reports::collect(&plan.modules, id, request.kind == "test");
         // Environment values are never serialized; mask known credentials in bounded failure details.
         for detail in &mut evidence.details {
             for (key, value) in &plan.environment {

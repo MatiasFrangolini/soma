@@ -9,7 +9,7 @@ use std::{
     fs,
     io::{BufReader, Read},
     os::windows::fs::MetadataExt,
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -227,7 +227,7 @@ fn file(path: &Path, job: &str) -> Result<Evidence> {
     result.executed = result.tests - result.skipped;
     Ok(result)
 }
-pub fn collect(directory: &Path, job: &str, requested: bool) -> Evidence {
+pub fn collect(modules: &[PathBuf], job: &str, requested: bool) -> Evidence {
     if !requested {
         return Evidence {
             status: "not_requested".into(),
@@ -235,11 +235,16 @@ pub fn collect(directory: &Path, job: &str, requested: bool) -> Evidence {
         };
     }
     let mut output = Evidence::default();
-    let mut pending = vec![(directory.to_path_buf(), 0)];
+    let directories = modules.iter().flat_map(|module| {
+        [
+            module.join("target/surefire-reports"),
+            module.join("target/failsafe-reports"),
+        ]
+    });
     let suffix = format!("-{job}.xml");
     let mut visited = 0;
-    while let Some((dir, depth)) = pending.pop() {
-        if depth > 32 || visited > 100_000 {
+    for dir in directories {
+        if visited > 100_000 {
             output
                 .diagnostics
                 .push("Se alcanzó el límite de exploración de reportes".into());
@@ -247,6 +252,7 @@ pub fn collect(directory: &Path, job: &str, requested: bool) -> Evidence {
         }
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => {
                 if output.diagnostics.len() < 20 {
                     output
@@ -262,8 +268,11 @@ pub fn collect(directory: &Path, job: &str, requested: bool) -> Evidence {
                 output
                     .diagnostics
                     .push("Se alcanzó el límite de exploración de reportes".into());
-                pending.clear();
                 break;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("TEST-") || !name.ends_with(&suffix) {
+                continue;
             }
             let path = entry.path();
             let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -272,18 +281,7 @@ pub fn collect(directory: &Path, job: &str, requested: bool) -> Evidence {
             if meta.file_attributes() & 0x400 != 0 {
                 continue;
             }
-            let name = entry.file_name().to_string_lossy().into_owned();
-            if meta.is_dir() {
-                if !matches!(name.as_str(), ".git" | "node_modules" | ".idea" | ".gradle") {
-                    pending.push((path, depth + 1));
-                }
-                continue;
-            }
-            let report_directory = dir.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if !matches!(report_directory, "surefire-reports" | "failsafe-reports")
-                || !name.starts_with("TEST-")
-                || !name.ends_with(&suffix)
-            {
+            if !meta.is_file() {
                 continue;
             }
             match file(&path, job) {
@@ -338,6 +336,10 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("TEST-Probe-job-current.xml");
         fs::write(dir.join("TEST-stale.xml"), "<testsuite tests=\"999\"/>").unwrap();
+        let unrelated = root.join("unrelated/target/surefire-reports");
+        fs::create_dir_all(&unrelated).unwrap();
+        let unrelated_report = unrelated.join("TEST-unrelated-job-current.xml");
+        fs::write(&unrelated_report, "<truncated-unrelated-checkout").unwrap();
         let suite =
             "<testsuite tests=\"1\" failures=\"0\" errors=\"0\" skipped=\"0\" time=\"0.25\">";
         for tail in [
@@ -347,20 +349,30 @@ mod tests {
             "<testcase name=\"x\"><other></testcase></testsuite>",
         ] {
             fs::write(&path, format!("{suite}{tail}")).unwrap();
-            assert_eq!(collect(&root, "job-current", true).status, "incomplete");
+            assert_eq!(
+                collect(std::slice::from_ref(&root), "job-current", true).status,
+                "incomplete"
+            );
         }
         fs::write(&path, format!("{suite}<testcase name=\"x\"/></testsuite>")).unwrap();
-        let evidence = collect(&root, "job-current", true);
+        let evidence = collect(std::slice::from_ref(&root), "job-current", true);
         assert_eq!(
             (evidence.status.as_str(), evidence.tests, evidence.executed),
             ("passed", 1, 1)
         );
         assert_eq!(evidence.test_reported_ms, 250.0);
         fs::remove_file(&path).unwrap();
-        assert_eq!(collect(&root, "job-current", true).status, "no_tests");
+        assert_eq!(
+            collect(std::slice::from_ref(&root), "job-current", true).status,
+            "no_tests"
+        );
         let _ = fs::remove_file(dir.join("TEST-stale.xml"));
         let _ = fs::remove_dir(&dir);
         let _ = fs::remove_dir(root.join("target"));
+        let _ = fs::remove_file(unrelated_report);
+        let _ = fs::remove_dir(unrelated);
+        let _ = fs::remove_dir(root.join("unrelated/target"));
+        let _ = fs::remove_dir(root.join("unrelated"));
         let _ = fs::remove_dir(root);
     }
 }

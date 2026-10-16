@@ -66,7 +66,7 @@ try {
 $archive=[IO.Compression.ZipFile]::OpenRead($Package)
 try{
     $names=@($archive.Entries|ForEach-Object FullName|Sort-Object)
-    $allowed=@('AGENTS.md','LICENSE','README.md','Soma.exe','build-info.json','soma-cli.exe')|Sort-Object
+    $allowed=@('AGENTS.md','LICENSE','README.md','Soma.exe','Update-Soma.ps1','build-info.json','soma-cli.exe')|Sort-Object
     Assert (($names -join '|') -eq ($allowed -join '|')) 'Public ZIP contains exactly the declared files and no private configuration or logs'
     $entry=$archive.GetEntry('build-info.json');$reader=[IO.StreamReader]::new($entry.Open())
     try{$info=$reader.ReadToEnd()|ConvertFrom-Json}finally{$reader.Dispose()}

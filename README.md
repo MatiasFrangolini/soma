@@ -1,6 +1,6 @@
 # Soma
 
-Runner liviano para Windows x64: elegí un proyecto, compilá, ejecutá y leé sus logs sin abrir un IDE. Interfaz nativa Win32 escrita en Rust y CLI JSON para agentes, sin WebView ni servicio permanente.
+Runner liviano para Windows x64: elegí un proyecto, compilá, ejecutá y leé sus logs sin abrir un IDE. Interfaz nativa Win32 escrita en Rust, sin WebView ni servicio permanente. Se usa desde la ventana; la CLI JSON es opcional.
 
 ## Instalar
 
@@ -16,12 +16,14 @@ Abrí **Soma** desde Inicio o ejecutá `soma`. Los agentes usan `soma-cli help`.
 Para actualizar, cerrá Soma y ejecutá:
 
 ```powershell
-scoop update soma
+soma-update
 ```
 
 Para desinstalar: `scoop uninstall soma`. Tus datos se conservan en `%USERPROFILE%\.soma`.
 
-Soma no requiere Rust, IntelliJ, .NET ni Java para abrir su interfaz. Java/JDK y Maven son necesarios únicamente para los proyectos que los usan. Windows Terminal es opcional para abrir una terminal externa.
+Soma no requiere Codex, IA, cuentas de servicios, Rust, IntelliJ, .NET ni Java para abrir su interfaz. Java/JDK y Maven son necesarios únicamente para los proyectos que los usan. Windows Terminal es opcional para abrir una terminal externa.
+
+`soma-update` refresca el catálogo de Scoop y actualiza únicamente Soma. También podés ejecutar `scoop update` seguido de `scoop update soma`. El script termina al completar la operación; no hay actualizador residente.
 
 ## Usar
 

@@ -154,6 +154,7 @@ public static class SomaTargetUi {
     Select-Combo 106 1
     $saved=Get-Content (Join-Path $data 'projects.json') -Raw|ConvertFrom-Json
     Assert ($saved.projects[0].selected_worktree -eq $linked) 'Native worktree selection is remembered without rewriting the base project directory'
+    Select-Combo 102 0
     $null=[SomaTargetUi]::SendMessageW($window,0x111,[IntPtr]111,[IntPtr]::Zero)
     $state=Wait-State @('running','failed')
     Assert ($state.state -eq 'running' -and $state.directory -eq $linked) 'Native Run executes the selected worktree'

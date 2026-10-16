@@ -1,4 +1,6 @@
 import java.nio.file.*;
+import java.net.InetSocketAddress;
+import com.sun.net.httpserver.HttpServer;
 public class Probe {
     public static void main(String[] args) throws Exception {
         String mode = args.length == 0 ? "normal" : args[0];
@@ -11,6 +13,24 @@ public class Probe {
         System.out.println("PARENT_PID=" + ProcessHandle.current().pid());
         System.out.println("MODE=" + System.getenv("SOMA_MODE"));
         System.out.println("UNICODE=áéíóú ñ ✓");
+        System.out.println("CWD=" + Path.of("").toAbsolutePath());
+        if (Files.exists(Path.of("marker.txt"))) System.out.println("MARKER=" + Files.readString(Path.of("marker.txt")).strip());
+        if (mode.equals("exit")) return;
+        if (mode.equals("http") || mode.equals("down") || mode.equals("http-wildcard")) {
+            long readyAt = System.nanoTime() + Long.parseLong(args[2]) * 1_000_000L;
+            int port = Integer.parseInt(args[1]);
+            HttpServer server = HttpServer.create(mode.equals("http-wildcard") ? new InetSocketAddress(port) : new InetSocketAddress("127.0.0.1", port), 0);
+            server.createContext("/health", exchange -> {
+                boolean ready = !mode.equals("down") && System.nanoTime() >= readyAt;
+                byte[] body = ("{\"status\":\"" + (ready ? "UP" : "DOWN") + "\"}").getBytes(java.nio.charset.StandardCharsets.UTF_8);
+                exchange.getResponseHeaders().set("Content-Type", "application/json");
+                exchange.sendResponseHeaders(200, body.length);
+                exchange.getResponseBody().write(body);
+                exchange.close();
+            });
+            server.start();
+            System.out.println("HTTP_STARTED");
+        }
         if (mode.equals("spam")) {
             String line = "ñ✓".repeat(1800) + "\n";
             for (int i = 0; i < 6000; i++) System.out.print(line);

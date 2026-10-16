@@ -42,6 +42,10 @@ pub struct Status {
     pub error: Option<String>,
     pub forced: bool,
     pub started_at: Option<u64>,
+    pub directory: Option<PathBuf>,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub readiness: String,
 }
 impl Default for Status {
     fn default() -> Self {
@@ -56,6 +60,10 @@ impl Default for Status {
             error: None,
             forced: false,
             started_at: None,
+            directory: None,
+            branch: None,
+            head: None,
+            readiness: "not_configured".into(),
         }
     }
 }
@@ -202,7 +210,13 @@ impl Engine {
         s.state = state.into();
     }
     pub fn stop(&self) -> Value {
+        self.stop_expected(None)
+    }
+    pub fn stop_expected(&self, expected: Option<&str>) -> Value {
         let mut s = self.state.lock().unwrap();
+        if expected.is_some() && expected != s.operation_id.as_deref() {
+            return json!({"ok":false,"code":"operation_replaced","error":"El ID no corresponde a la ejecución actual","status":*s});
+        }
         if !s.busy() {
             return json!({"ok":true,"state":s.state});
         }
@@ -213,13 +227,31 @@ impl Engine {
         json!({"ok":true,"operation_id":s.operation_id,"state":"stopping"})
     }
     pub fn start(self: &Arc<Self>, project: &str, config: Option<&str>, mode: &str) -> Value {
+        self.start_at(project, config, mode, None, None)
+    }
+    pub fn start_at(
+        self: &Arc<Self>,
+        project: &str,
+        config: Option<&str>,
+        mode: &str,
+        directory: Option<&Path>,
+        readiness: Option<crate::readiness::Readiness>,
+    ) -> Value {
         if !matches!(mode, "build" | "run" | "reuse") {
             return crate::error("Modo inválido");
         }
-        let (p, c) = match self.store.find(project, config) {
+        let (p, mut c) = match self.store.target(project, config, directory) {
             Ok(v) => v,
             Err(e) => return crate::error(e),
         };
+        if let Some(value) = readiness {
+            c.readiness = Some(value);
+        }
+        if let Some(value) = &c.readiness {
+            if let Err(error) = value.target() {
+                return crate::error(error);
+            }
+        }
         let mut s = self.state.lock().unwrap();
         if s.busy() {
             return json!({"ok":false,"code":"busy","error":"Ya hay una ejecución activa"});
@@ -238,6 +270,7 @@ impl Engine {
             project: Some(p.id.clone()),
             config: Some(c.id.clone()),
             started_at: Some(now()),
+            directory: Some(p.directory.clone()),
             ..Default::default()
         };
         let cancel = Arc::new(AtomicBool::new(false));
@@ -284,12 +317,27 @@ impl Engine {
         mode: &str,
         cancel: &Arc<AtomicBool>,
     ) -> Result<u32> {
+        let _lease = crate::git::CheckoutLease::acquire(&p.directory)?;
+        // Snapshot the checkout only after other Soma owners can no longer switch it.
+        let branch = model::branch(&p.directory);
+        let head = crate::git::head(&p.directory);
+        {
+            let mut state = self.state.lock().unwrap();
+            state.branch = Some(branch);
+            state.head = head;
+        }
         let env = model::environment(p, c)?;
-        let stamp_path = self
-            .store
-            .home
-            .join("builds")
-            .join(format!("{}--{}.json", p.id, c.id));
+        use sha2::{Digest, Sha256};
+        let target_hash = format!(
+            "{:x}",
+            Sha256::digest(p.directory.to_string_lossy().as_bytes())
+        );
+        let stamp_path = self.store.home.join("builds").join(format!(
+            "{}--{}--{}.json",
+            p.id,
+            c.id,
+            &target_hash[..16]
+        ));
         let needs_stamp = c.build.is_some() || matches!(c.run, RunSpec::JavaJar { .. });
         let fingerprint = if needs_stamp {
             Some(model::fingerprint(p, c, &env)?)
@@ -330,7 +378,7 @@ impl Engine {
                         .to_string_lossy()
                         .into(),
                 );
-                let code = self.execute(command, &env, cancel)?;
+                let code = self.execute(command, &env, cancel, None)?;
                 if code != 0 || cancel.load(Ordering::SeqCst) {
                     return Ok(code);
                 }
@@ -402,13 +450,20 @@ impl Engine {
             },
         };
         self.phase("aplicación", "starting");
-        self.execute(run, &env, cancel)
+        self.state.lock().unwrap().readiness = if c.readiness.is_some() {
+            "pending"
+        } else {
+            "not_configured"
+        }
+        .into();
+        self.execute(run, &env, cancel, c.readiness.as_ref())
     }
     fn execute(
         &self,
         command: CommandSpec,
         env: &BTreeMap<String, String>,
         cancel: &Arc<AtomicBool>,
+        readiness: Option<&crate::readiness::Readiness>,
     ) -> Result<u32> {
         let exe = std::env::current_exe()
             .map_err(|e| e.to_string())?
@@ -482,6 +537,10 @@ impl Engine {
             .collect::<Vec<_>>();
         let mut stop_at = None;
         let mut forced = false;
+        let ready_target = readiness.map(|spec| spec.target()).transpose()?;
+        let startup_at = Instant::now();
+        let mut next_probe = Instant::now();
+        let mut checking_ready = readiness.is_some();
         loop {
             let done = unsafe { WaitForSingleObject(worker.process.0 as HANDLE, 75) };
             if done == WAIT_OBJECT_0 {
@@ -495,6 +554,25 @@ impl Engine {
                 let _ = worker.input.flush();
                 stop_at = Some(Instant::now());
                 self.note("Cierre ordenado solicitado; límite 15 segundos");
+            }
+            if checking_ready && stop_at.is_none() && Instant::now() >= next_probe {
+                let spec = readiness.unwrap();
+                if ready_target
+                    .as_ref()
+                    .unwrap()
+                    .probe(spec, worker.job.0 as HANDLE)
+                {
+                    self.state.lock().unwrap().readiness = "ready".into();
+                    self.note("Aplicación lista: readiness confirmado en un proceso propio");
+                    checking_ready = false;
+                } else if startup_at.elapsed() >= Duration::from_secs(spec.timeout_seconds) {
+                    self.state.lock().unwrap().readiness = "timed_out".into();
+                    self.note(
+                        "Readiness agotó su plazo; el proceso sigue activo. Consultá sus logs",
+                    );
+                    checking_ready = false;
+                }
+                next_probe = Instant::now() + Duration::from_millis(750);
             }
             if stop_at
                 .map(|t| t.elapsed() >= Duration::from_secs(15))
@@ -524,6 +602,18 @@ impl Engine {
         }
         self.note(format!("Proceso finalizado · código {code}"));
         Ok(code)
+    }
+    pub fn switch_branch(&self, project: &str, directory: Option<&Path>, branch: &str) -> Value {
+        let state = self.state.lock().unwrap();
+        if state.busy() {
+            return json!({"ok":false,"code":"busy","error":"Detené la ejecución antes de cambiar de rama"});
+        }
+        let result = self.store.target(project, None, directory).and_then(|(p,_)| {
+            let _lease = crate::git::CheckoutLease::acquire(&p.directory)?;
+            crate::git::switch(&p.directory, branch)?;
+            Ok(json!({"ok":true,"directory":p.directory,"branch":model::branch(&p.directory),"head":crate::git::head(&p.directory)}))
+        });
+        result.unwrap_or_else(crate::error)
     }
 }
 struct Owned(isize);

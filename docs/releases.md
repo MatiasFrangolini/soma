@@ -8,7 +8,7 @@ Para publicar una versión:
 2. Validá los cambios y guardalos en un commit en `main`.
 3. Ejecutá `pwsh ./scripts/Release.ps1`.
 
-El script sube `main` y el tag correspondiente. GitHub Actions compila Windows x64, ejecuta las pruebas de procesos y distribución, genera un ZIP con SHA-256 y publica una release. Después actualiza `bucket/soma.json` en `main`. No se publica ningún paquete si falla la compilación o las pruebas.
+El script sube `main` y el tag correspondiente. GitHub Actions compila Windows x64, ejecuta las pruebas de procesos, distribución, worktrees y readiness, genera un ZIP con SHA-256 y publica una release. Después actualiza `bucket/soma.json` en `main`. No se publica ningún paquete si falla la compilación o las pruebas.
 
 Si una ejecución falla, resolvé su causa y publicá una versión nueva. No sobrescribas binarios de una versión que otras personas ya instalaron. La comprobación local de un bundle se hace con `scripts/Package.ps1 -BinaryDirectory RUTA` y `tests/distribution.ps1`; no sustituye la ejecución de CI en el runner Windows.
 

@@ -27,6 +27,8 @@ pub struct Project {
     pub id: String,
     pub name: String,
     pub directory: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_worktree: Option<PathBuf>,
     pub configs: Vec<Config>,
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -51,6 +53,8 @@ pub struct Config {
     pub inputs: Vec<String>,
     #[serde(default)]
     pub input_excludes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<crate::readiness::Readiness>,
 }
 fn default_inputs() -> Vec<String> {
     vec![".".into()]
@@ -202,6 +206,9 @@ impl Store {
                 if !configs.insert(c.id.clone()) {
                     return Err("ID de configuración duplicado".into());
                 }
+                if let Some(ready) = &c.readiness {
+                    ready.target()?;
+                }
             }
         }
         Ok(value)
@@ -228,6 +235,94 @@ impl Store {
             return Err("El directorio del proyecto no existe".into());
         }
         Ok((p, c))
+    }
+    pub fn project_at(&self, directory: &Path) -> Result<String> {
+        let path = plain(fs::canonicalize(directory).map_err(|_| "El directorio no existe")?);
+        let settings = self.load()?;
+        settings
+            .projects
+            .iter()
+            .find(|p| p.directory == path)
+            .or_else(|| {
+                settings
+                    .projects
+                    .iter()
+                    .find(|p| crate::git::same_project(&p.directory, &path))
+            })
+            .map(|p| p.id.clone())
+            .ok_or_else(|| "Proyecto no registrado: usá add --path DIRECTORIO".into())
+    }
+    pub fn target(
+        &self,
+        project: &str,
+        config: Option<&str>,
+        directory: Option<&Path>,
+    ) -> Result<(Project, Config)> {
+        let (mut p, mut c) = self.find(project, config)?;
+        let chosen = directory
+            .or(p.selected_worktree.as_deref())
+            .unwrap_or(&p.directory);
+        let chosen =
+            plain(fs::canonicalize(chosen).map_err(|_| "El worktree seleccionado no existe")?);
+        if !crate::git::same_project(&p.directory, &chosen) {
+            return Err("El directorio no corresponde a este proyecto/worktree".into());
+        }
+        let rebase = |value: &mut String| {
+            if let Ok(relative) = Path::new(value).strip_prefix(&p.directory) {
+                *value = chosen.join(relative).to_string_lossy().into();
+            }
+        };
+        if let Some(file) = &mut c.env_file {
+            rebase(file);
+        }
+        if let Some(jdk) = &mut c.jdk {
+            rebase(jdk);
+        }
+        for file in &mut c.config_files {
+            rebase(file);
+        }
+        for file in &mut c.inputs {
+            rebase(file);
+        }
+        if let Some(build) = &mut c.build {
+            rebase(&mut build.executable);
+            for arg in &mut build.args {
+                rebase(arg);
+            }
+            if let Some(dir) = &mut build.directory {
+                rebase(dir);
+            }
+        }
+        match &mut c.run {
+            RunSpec::JavaJar { artifact, args, .. } => {
+                rebase(artifact);
+                for arg in args {
+                    rebase(arg);
+                }
+            }
+            RunSpec::Command { executable, args } => {
+                rebase(executable);
+                for arg in args {
+                    rebase(arg);
+                }
+            }
+        }
+        p.directory = chosen;
+        Ok((p, c))
+    }
+    pub fn select_worktree(&self, project: &str, directory: &Path) -> Result<()> {
+        let mut settings = self.load()?;
+        let p = settings
+            .projects
+            .iter_mut()
+            .find(|p| p.id == project)
+            .ok_or("Proyecto no encontrado")?;
+        let path = plain(fs::canonicalize(directory).map_err(|_| "El worktree no existe")?);
+        if !crate::git::same_project(&p.directory, &path) {
+            return Err("Worktree de otro proyecto".into());
+        }
+        p.selected_worktree = (path != p.directory).then_some(path);
+        self.save(&settings)
     }
     pub fn add_directory(&self, path: &Path) -> Result<String> {
         let dir = plain(fs::canonicalize(path).map_err(|e| e.to_string())?);
@@ -342,12 +437,14 @@ impl Store {
                 },
                 inputs: default_inputs(),
                 input_excludes: vec![],
+                readiness: None,
             });
         }
         s.projects.push(Project {
             id: id.clone(),
             name,
             directory: dir,
+            selected_worktree: None,
             configs,
         });
         self.save(&s)?;
@@ -365,7 +462,7 @@ pub fn validate_id(id: &str) -> Result<()> {
         Ok(())
     }
 }
-fn plain(path: PathBuf) -> PathBuf {
+pub(crate) fn plain(path: PathBuf) -> PathBuf {
     let s = path.to_string_lossy();
     if let Some(v) = s.strip_prefix("\\\\?\\UNC\\") {
         PathBuf::from(format!("\\\\{v}"))
@@ -541,7 +638,10 @@ pub fn fingerprint(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> R
     files.sort();
     files.dedup();
     let mut h = Sha256::new();
-    h.update(serde_json::to_vec(c).unwrap());
+    h.update(p.directory.to_string_lossy().as_bytes());
+    let mut build_config = c.clone();
+    build_config.readiness = None;
+    h.update(serde_json::to_vec(&build_config).unwrap());
     // Build tools may interpolate any environment value. Persist only the digest.
     h.update(serde_json::to_vec(env).unwrap());
     h.update(branch(&p.directory));

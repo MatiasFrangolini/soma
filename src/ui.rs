@@ -21,6 +21,7 @@ const CONFIG: i32 = 102;
 const FOLDER: i32 = 103;
 const REFRESH: i32 = 104;
 const EDIT_CONFIG: i32 = 105;
+const WORKTREE: i32 = 106;
 const BUILD: i32 = 110;
 const RUN: i32 = 111;
 const REUSE: i32 = 112;
@@ -39,6 +40,8 @@ const STATUS: i32 = 133;
 const HINT: i32 = 134;
 const P_LABEL: i32 = 135;
 const C_LABEL: i32 = 136;
+const W_LABEL: i32 = 137;
+const B_LABEL: i32 = 138;
 fn rgb(r: u32, g: u32, b: u32) -> u32 {
     r | (g << 8) | (b << 16)
 }
@@ -78,6 +81,8 @@ struct Ui {
     search_at: usize,
     last_status: String,
     refreshing: bool,
+    worktrees: Vec<crate::git::Worktree>,
+    branches: Vec<String>,
 }
 impl Ui {
     fn new(engine: Arc<Engine>) -> Self {
@@ -98,6 +103,8 @@ impl Ui {
                 search_at: 0,
                 last_status: String::new(),
                 refreshing: false,
+                worktrees: Vec::new(),
+                branches: Vec::new(),
             }
         }
     }
@@ -192,6 +199,8 @@ impl Ui {
         );
         self.create(h, P_LABEL, "STATIC", "Proyecto", 0);
         self.create(h, C_LABEL, "STATIC", "Config", 0);
+        self.create(h, W_LABEL, "STATIC", "Worktree", 0);
+        self.create(h, B_LABEL, "STATIC", "Rama", 0);
         self.create(
             h,
             PROJECT,
@@ -206,6 +215,15 @@ impl Ui {
             "",
             CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
         );
+        for id in [WORKTREE, BRANCH] {
+            self.create(
+                h,
+                id,
+                "COMBOBOX",
+                "",
+                CBS_DROPDOWNLIST as u32 | WS_TABSTOP | WS_VSCROLL,
+            );
+        }
         for (id, text) in [
             (FOLDER, "&Carpeta..."),
             (REFRESH, "&Actualizar"),
@@ -222,7 +240,7 @@ impl Ui {
         ] {
             self.create(h, id, "BUTTON", text, BS_OWNERDRAW as u32 | WS_TABSTOP);
         }
-        for id in [DIR, BRANCH, STATUS] {
+        for id in [DIR, STATUS] {
             self.create(h, id, "STATIC", "", 0x0000000C);
         }
         self.create(h,LOG_VIEW,"EDIT","Elegí un proyecto y una configuración para comenzar.\r\n\r\nLos agentes pueden usar soma-cli.exe help.\r\n",ES_MULTILINE as u32|ES_READONLY as u32|ES_AUTOVSCROLL as u32|ES_AUTOHSCROLL as u32|WS_VSCROLL|WS_HSCROLL|WS_TABSTOP);
@@ -298,17 +316,73 @@ impl Ui {
                 );
             }
             SendMessageW(self.h(CONFIG), CB_SETCURSEL, 0, 0);
-            self.text(DIR, &p.directory.to_string_lossy());
-            self.text(
-                BRANCH,
-                &format!("Rama: {}", crate::model::branch(&p.directory)),
-            );
+            self.worktrees = crate::git::worktrees(&p.directory);
+            if self.worktrees.is_empty() {
+                self.worktrees.push(crate::git::Worktree {
+                    directory: p.directory.clone(),
+                    branch: crate::model::branch(&p.directory),
+                    head: crate::git::head(&p.directory).unwrap_or_default(),
+                    locked: false,
+                    prunable: false,
+                });
+            }
+            SendMessageW(self.h(WORKTREE), CB_RESETCONTENT, 0, 0);
+            for item in &self.worktrees {
+                let label = format!("{} · {}", item.branch, item.directory.display());
+                SendMessageW(
+                    self.h(WORKTREE),
+                    CB_ADDSTRING,
+                    0,
+                    wide(&label).as_ptr() as isize,
+                );
+            }
+            let chosen = p.selected_worktree.as_ref().unwrap_or(&p.directory);
+            let chosen = self
+                .worktrees
+                .iter()
+                .position(|item| &item.directory == chosen)
+                .unwrap_or(0);
+            SendMessageW(self.h(WORKTREE), CB_SETCURSEL, chosen, 0);
+            self.checkout_changed();
         } else {
             self.text(
                 DIR,
                 "Sin proyectos. Elegí una carpeta o usá la CLI para registrar uno.",
             );
-            self.text(BRANCH, "");
+            SendMessageW(self.h(WORKTREE), CB_RESETCONTENT, 0, 0);
+            SendMessageW(self.h(BRANCH), CB_RESETCONTENT, 0, 0);
+        }
+    }
+    unsafe fn selected_directory(&self) -> Option<PathBuf> {
+        let index = SendMessageW(self.h(WORKTREE), CB_GETCURSEL, 0, 0);
+        self.worktrees
+            .get(index as usize)
+            .map(|item| item.directory.clone())
+    }
+    unsafe fn checkout_changed(&mut self) {
+        if let Some(directory) = self.selected_directory() {
+            self.text(DIR, &directory.to_string_lossy());
+            self.branches = crate::git::branches(&directory);
+            let current = crate::model::branch(&directory);
+            if current == "HEAD detached" {
+                self.branches.insert(0, current.clone());
+            }
+            SendMessageW(self.h(BRANCH), CB_RESETCONTENT, 0, 0);
+            for branch in &self.branches {
+                SendMessageW(
+                    self.h(BRANCH),
+                    CB_ADDSTRING,
+                    0,
+                    wide(branch).as_ptr() as isize,
+                );
+            }
+            if let Some(index) = self.branches.iter().position(|branch| branch == &current) {
+                SendMessageW(self.h(BRANCH), CB_SETCURSEL, index, 0);
+            }
+            EnableWindow(
+                self.h(BRANCH),
+                (!self.engine.status().busy() && !self.branches.is_empty()) as i32,
+            );
         }
     }
     unsafe fn layout(&self, h: HWND) {
@@ -337,13 +411,16 @@ impl Ui {
         place(PROJECT, pad + 86, 68, (avail - 370).max(180), 300);
         place(FOLDER, w - pad - 268, 68, 142, 31);
         place(REFRESH, w - pad - 114, 68, 114, 31);
-        place(DIR, pad, 111, avail, 24);
-        place(C_LABEL, pad, 151, 82, 24);
-        place(CONFIG, pad + 86, 145, 220, 300);
-        place(EDIT_CONFIG, pad + 318, 145, 142, 31);
-        place(BRANCH, pad + 478, 151, (avail - 478).max(50), 24);
+        place(W_LABEL, pad, 111, 82, 24);
+        place(WORKTREE, pad + 86, 106, avail - 86, 300);
+        place(DIR, pad, 147, avail, 24);
+        place(C_LABEL, pad, 187, 82, 24);
+        place(CONFIG, pad + 86, 181, 220, 300);
+        place(EDIT_CONFIG, pad + 318, 181, 142, 31);
+        place(B_LABEL, pad + 478, 187, 44, 24);
+        place(BRANCH, pad + 528, 181, (avail - 528).max(50), 300);
         let mut x = pad;
-        let mut y = 197;
+        let mut y = 233;
         for (id, bw) in [
             (BUILD, 86),
             (RUN, 164),
@@ -378,14 +455,48 @@ impl Ui {
         self.refreshing = true;
         let state = self.engine.status();
         let busy = state.busy();
+        if busy {
+            if let (Some(project), Some(directory)) = (&state.project, &state.directory) {
+                if self.selected().map(|(p, _)| p).as_ref() != Some(project)
+                    || self.selected_directory().as_ref() != Some(directory)
+                    || self.selected().and_then(|(_, c)| c).as_ref() != state.config.as_ref()
+                {
+                    self.reload(Some(project.clone()));
+                    if let Some(index) = self
+                        .worktrees
+                        .iter()
+                        .position(|item| &item.directory == directory)
+                    {
+                        SendMessageW(self.h(WORKTREE), CB_SETCURSEL, index, 0);
+                        self.checkout_changed();
+                    }
+                    let project_index = SendMessageW(self.h(PROJECT), CB_GETCURSEL, 0, 0);
+                    if let Some(p) = self.settings.projects.get(project_index as usize) {
+                        if let Some(index) = p
+                            .configs
+                            .iter()
+                            .position(|c| Some(&c.id) == state.config.as_ref())
+                        {
+                            SendMessageW(self.h(CONFIG), CB_SETCURSEL, index, 0);
+                        }
+                    }
+                }
+            }
+        }
         let title = format!(
-            "{}  {}{}",
+            "{}  {} · {}{}",
             if self.closing {
                 "Cerrando"
             } else {
                 &state.state
             },
             state.project.as_deref().unwrap_or(""),
+            match state.readiness.as_str() {
+                "ready" => "API lista",
+                "pending" => "Esperando API",
+                "timed_out" => "API sin confirmar",
+                _ => &state.phase,
+            },
             state
                 .error
                 .as_ref()
@@ -395,9 +506,13 @@ impl Ui {
         if title != self.last_status {
             self.text(STATUS, &title);
             self.last_status = title;
-            for id in [BUILD, RUN, REUSE] {
+            for id in [BUILD, RUN, REUSE, PROJECT, CONFIG, WORKTREE, FOLDER] {
                 EnableWindow(self.h(id), (!busy && !self.closing) as i32);
             }
+            EnableWindow(
+                self.h(BRANCH),
+                (!busy && !self.closing && !self.branches.is_empty()) as i32,
+            );
             EnableWindow(self.h(STOP), busy as i32);
         }
         if !self.paused {
@@ -435,15 +550,66 @@ impl Ui {
         );
     }
     unsafe fn command(&mut self, h: HWND, id: i32, notification: u32) {
+        if self.refreshing {
+            return;
+        }
         if id == PROJECT && notification == CBN_SELCHANGE {
             self.project_changed();
+            return;
+        }
+        if id == WORKTREE && notification == CBN_SELCHANGE {
+            if !self.engine.status().busy() {
+                if let (Some((project, _)), Some(directory)) =
+                    (self.selected(), self.selected_directory())
+                {
+                    if let Err(error) = self.engine.store.select_worktree(&project, &directory) {
+                        self.engine.note(error);
+                    }
+                }
+                self.checkout_changed();
+            }
+            return;
+        }
+        if id == BRANCH && notification == CBN_SELCHANGE {
+            let index = SendMessageW(self.h(BRANCH), CB_GETCURSEL, 0, 0);
+            if let (Some(branch), Some((project, _)), Some(directory)) = (
+                self.branches.get(index as usize),
+                self.selected(),
+                self.selected_directory(),
+            ) {
+                if branch != "HEAD detached" {
+                    let result = self
+                        .engine
+                        .switch_branch(&project, Some(&directory), branch);
+                    if result["ok"] != true {
+                        self.engine.note(
+                            result["error"]
+                                .as_str()
+                                .unwrap_or("No se pudo cambiar de rama"),
+                        );
+                    }
+                    let config_index = SendMessageW(self.h(CONFIG), CB_GETCURSEL, 0, 0);
+                    self.reload(Some(project));
+                    SendMessageW(self.h(CONFIG), CB_SETCURSEL, config_index as usize, 0);
+                }
+            }
             return;
         }
         if notification != BN_CLICKED
             || !matches!(
                 id,
-                FOLDER | REFRESH | EDIT_CONFIG | BUILD | RUN | REUSE | STOP | TERMINAL | LOGS
-                    | FIND | PAUSE | CLEAR
+                FOLDER
+                    | REFRESH
+                    | EDIT_CONFIG
+                    | BUILD
+                    | RUN
+                    | REUSE
+                    | STOP
+                    | TERMINAL
+                    | LOGS
+                    | FIND
+                    | PAUSE
+                    | CLEAR
             )
         {
             return;
@@ -479,7 +645,7 @@ impl Ui {
             LOGS => self.open(&self.engine.store.home.join("logs")),
             BUILD | RUN | REUSE => {
                 if let Some((p, Some(c))) = self.selected() {
-                    let result = self.engine.start(
+                    let result = self.engine.start_at(
                         &p,
                         Some(&c),
                         if id == BUILD {
@@ -489,6 +655,8 @@ impl Ui {
                         } else {
                             "run"
                         },
+                        self.selected_directory().as_deref(),
+                        None,
                     );
                     if result["ok"] != true {
                         self.engine
@@ -503,15 +671,13 @@ impl Ui {
                 self.engine.stop();
             }
             TERMINAL => {
-                if let Some((id, _)) = self.selected() {
-                    if let Some(p) = self.settings.projects.iter().find(|p| p.id == id) {
-                        if let Err(e) = crate::launch_windowed(
-                            std::path::Path::new("wt.exe"),
-                            &format!("-d \"{}\"", p.directory.display()),
-                        ) {
-                            self.engine
-                                .note(format!("No se pudo abrir Windows Terminal: {e}"));
-                        }
+                if let Some(directory) = self.selected_directory() {
+                    if let Err(e) = crate::launch_windowed(
+                        std::path::Path::new("wt.exe"),
+                        &format!("-d \"{}\"", directory.display()),
+                    ) {
+                        self.engine
+                            .note(format!("No se pudo abrir Windows Terminal: {e}"));
                     }
                 }
             }

@@ -1,7 +1,9 @@
 pub mod cli;
 pub mod engine;
+pub mod git;
 pub mod ipc;
 pub mod model;
+pub mod readiness;
 pub mod ui;
 pub mod worker;
 

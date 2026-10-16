@@ -128,19 +128,58 @@ fn dispatch(engine: &Arc<Engine>, r: &Value) -> Value {
             r["config"].as_str(),
             r["command"].as_str().unwrap(),
         ),
-        "stop" => engine.stop(),
+        "start_target" => {
+            let readiness = match r.get("readiness").filter(|v| !v.is_null()) {
+                Some(value) => match serde_json::from_value(value.clone()) {
+                    Ok(value) => Some(value),
+                    Err(_) => return crate::error("Configuración readiness inválida"),
+                },
+                None => None,
+            };
+            engine.start_at(
+                r["project"].as_str().unwrap_or(""),
+                r["config"].as_str(),
+                r["mode"].as_str().unwrap_or("run"),
+                r["directory"].as_str().map(std::path::Path::new),
+                readiness,
+            )
+        }
+        "switch" => engine.switch_branch(
+            r["project"].as_str().unwrap_or(""),
+            r["directory"].as_str().map(std::path::Path::new),
+            r["branch"].as_str().unwrap_or(""),
+        ),
+        "stop" => engine.stop_expected(r["operation"].as_str()),
         "restart" => {
             let status = engine.status();
+            if let Some(expected) = r["operation"].as_str() {
+                if status.operation_id.as_deref() != Some(expected) {
+                    return json!({"ok":false,"code":"operation_replaced","error":"La ejecución actual tiene otro ID","status":status});
+                }
+            }
+            let directory = r["directory"]
+                .as_str()
+                .map(std::path::PathBuf::from)
+                .or(status.directory.clone());
             let project = r["project"].as_str().map(str::to_owned).or(status.project);
             let config = r["config"].as_str().map(str::to_owned).or(status.config);
             if let Some(project) = project {
                 if engine.status().busy() {
-                    engine.stop();
+                    let stopped = engine.stop_expected(r["operation"].as_str());
+                    if stopped["ok"] != true {
+                        return stopped;
+                    }
                     let e = engine.clone();
                     std::thread::spawn(move || {
                         for _ in 0..240 {
                             if !e.status().busy() {
-                                e.start(&project, config.as_deref(), "run");
+                                e.start_at(
+                                    &project,
+                                    config.as_deref(),
+                                    "run",
+                                    directory.as_deref(),
+                                    None,
+                                );
                                 return;
                             }
                             std::thread::sleep(std::time::Duration::from_millis(100));
@@ -149,7 +188,13 @@ fn dispatch(engine: &Arc<Engine>, r: &Value) -> Value {
                     });
                     json!({"ok":true,"state":"restarting"})
                 } else {
-                    engine.start(&project, config.as_deref(), "run")
+                    engine.start_at(
+                        &project,
+                        config.as_deref(),
+                        "run",
+                        directory.as_deref(),
+                        None,
+                    )
                 }
             } else {
                 crate::error("Falta proyecto")

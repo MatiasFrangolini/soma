@@ -53,6 +53,9 @@ jobs:
       - name: Distribution contracts
         shell: pwsh
         run: ./tests/distribution.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-distribution-qa') -Package (Get-ChildItem ./dist/Soma-*-windows-x64.zip).FullName
+      - name: Checkout and readiness contracts
+        shell: pwsh
+        run: ./tests/targets.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-targets-qa') -Jdk $env:JAVA_HOME_21_X64
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: soma-windows-release

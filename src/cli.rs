@@ -9,12 +9,15 @@ pub fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     if matches!(cmd, "help" | "--help" | "-h") {
-        println!("Soma {} — agente y ventana comparten una ejecución\n\n  projects [--json]\n  add --path DIRECTORIO\n  configs --project ID\n  validate\n  config-path\n  status\n  worktrees --path DIRECTORIO\n  branches --path DIRECTORIO\n  switch --path DIRECTORIO --branch RAMA\n  run --path DIRECTORIO [--config ID] [--reuse] [--wait-ready] [--health-url URL]\n  build --project ID [--config ID] [--wait]\n  wait --operation ID [--ready] [--timeout 600]\n  restart [--project ID] [--config ID]\n  stop [--operation ID]\n  logs [--tail 200]\n  show\n  close\n\nTodas las respuestas de operación son JSON. --data-dir PATH / SOMA_HOME cambia el almacenamiento.\nRun admite --project ID o --path y compila antes de iniciar. --reuse exige un build vigente.\n--wait espera la salida; --wait-ready espera la API. Stop con --operation rechaza un ID ajeno. El cierre de la ventana detiene sus procesos.", env!("CARGO_PKG_VERSION"));
+        println!("Soma {} — agente y ventana comparten una ejecución\n\n  projects [--json]\n  add --path DIRECTORIO\n  configs --project ID\n  validate\n  config-path\n  status\n  worktrees --path DIRECTORIO\n  branches --path DIRECTORIO\n  switch --path DIRECTORIO --branch RAMA\n  run --path DIRECTORIO [--config ID] [--reuse] [--wait-ready] [--health-url URL]\n  build --project ID [--config ID] [--wait]\n  wait --operation ID [--ready] [--timeout 600]\n  restart [--project ID] [--config ID]\n  stop [--operation ID]\n  logs [--tail 200]\n  jobs submit --path DIRECTORIO --config tests --kind test|build [--wait] -- ARGUMENTOS_MAVEN\n  jobs configs --path DIRECTORIO\n  jobs list\n  jobs status|wait|logs --job ID\n  jobs release --job ID --participant ID\n  show\n  close\n\nTodas las respuestas de operación son JSON. --data-dir PATH / SOMA_HOME cambia el almacenamiento.\nRun admite --project ID o --path y compila antes de iniciar. --reuse exige un build vigente.\n--wait espera la salida; --wait-ready espera la API. Stop con --operation rechaza un ID ajeno. El cierre de la ventana detiene sus procesos.", env!("CARGO_PKG_VERSION"));
         return 0;
     }
     let store = Store::from_args();
     if let Err(e) = store.initialize() {
         return print(crate::error(e));
+    }
+    if cmd == "jobs" {
+        return print(crate::jobs_cli::run(&store, &args[1..]));
     }
     let timeout = flag(&args, "--timeout")
         .and_then(|s| s.parse::<u64>().ok())
@@ -64,7 +67,7 @@ pub fn run() -> i32 {
         "configs"=>store.find(project.as_deref().unwrap_or_default(),flag(&args,"--config").as_deref()).and_then(|(p,_)|store.load().map(|s|json!({"ok":true,"project":p.id,"configs":s.projects.iter().find(|x|x.id==p.id).unwrap().configs.iter().map(|c|json!({"id":c.id,"name":c.name,"env_file":c.env_file,"override_names":c.env.keys().collect::<Vec<_>>(),"profiles":c.profiles,"jdk":c.jdk,"config_files":c.config_files})).collect::<Vec<_>>()}))),
         "add"=>store.add_directory(std::path::Path::new(&flag(&args,"--path").unwrap_or_default())).map(|id|json!({"ok":true,"project":id,"config_file":store.path()})),
         "config-path"=>Ok(json!({"ok":true,"path":store.path()})),
-        "validate"=>store.load().and_then(|s|{for p in &s.projects{if !p.directory.is_dir(){return Err(format!("{}: directorio no encontrado",p.id));}for c in &p.configs {crate::model::environment(p,c)?;}}Ok(json!({"ok":true,"projects":s.projects.len()}))}),
+        "validate"=>store.load().and_then(|s|{for p in &s.projects{if !p.directory.is_dir(){return Err(format!("{}: directorio no encontrado",p.id));}for c in &p.configs {crate::model::environment(p,c)?;}for c in &p.test_configs {crate::model::environment(p,&c.context())?;}}Ok(json!({"ok":true,"projects":s.projects.len()}))}),
         "status"|"stop"|"logs"|"run"|"build"|"restart"|"show"|"close"|"switch"=>{
             let mode=if cmd=="run"&&args.iter().any(|s|s=="--reuse"){"reuse"}else{cmd};
             let command=if matches!(cmd,"run"|"build"){"start_target"}else{cmd};
@@ -171,6 +174,9 @@ fn print(result: Value) -> i32 {
             Some("operation_replaced") => 7,
             Some("readiness_not_configured") => 8,
             Some("readiness_timeout") => 9,
+            Some("invalidated") => 10,
+            Some("validation_incomplete") => 11,
+            Some("interrupted") => 12,
             _ => 2,
         }
     }

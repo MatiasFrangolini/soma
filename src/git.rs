@@ -143,11 +143,17 @@ pub fn switch(dir: &Path, branch: &str) -> Result<()> {
 pub struct CheckoutLease(HANDLE);
 impl CheckoutLease {
     pub fn acquire(dir: &Path) -> Result<Self> {
+        Self::named(dir, "Checkout")
+    }
+    pub fn runtime(dir: &Path) -> Result<Self> {
+        Self::named(dir, "Runtime")
+    }
+    fn named(dir: &Path, kind: &str) -> Result<Self> {
         let hash = format!(
             "{:x}",
             Sha256::digest(dir.to_string_lossy().to_lowercase().as_bytes())
         );
-        let name = crate::wide(&format!("Local\\SomaCheckout-{hash}"));
+        let name = crate::wide(&format!("Local\\Soma{kind}-{hash}"));
         unsafe {
             let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
             if handle.is_null() {

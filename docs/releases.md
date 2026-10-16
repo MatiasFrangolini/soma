@@ -8,10 +8,10 @@ Para publicar una versión:
 2. Validá los cambios y guardalos en un commit en `main`.
 3. Ejecutá `pwsh ./scripts/Release.ps1`.
 
-El script sube `main` y el tag correspondiente. GitHub Actions compila Windows x64, ejecuta las pruebas de procesos, distribución, worktrees y readiness, genera un ZIP con SHA-256 y publica una release. Después actualiza `bucket/soma.json` en `main`. No se publica ningún paquete si falla la compilación o las pruebas.
+El script sube `main` y el tag correspondiente. GitHub Actions compila Windows x64, ejecuta los tests Rust y las pruebas de procesos, distribución, worktrees, readiness y trabajos Maven reales, genera un ZIP con SHA-256 y publica una release. Después actualiza `bucket/soma.json` en `main`. No se publica ningún paquete si falla la compilación o las pruebas. Conviene esperar el CI de `main` antes de crear el tag.
 
 Si una ejecución falla, resolvé su causa y publicá una versión nueva. No sobrescribas binarios de una versión que otras personas ya instalaron. La comprobación local de un bundle se hace con `scripts/Package.ps1 -BinaryDirectory RUTA` y `tests/distribution.ps1`; no sustituye la ejecución de CI en el runner Windows.
 
 Los usuarios cierran Soma y ejecutan `soma-update`. Scoop comprueba el hash, conserva las versiones según sus reglas y actualiza los shims y el acceso del menú Inicio. Los proyectos, logs y parámetros JVM están en `%USERPROFILE%\.soma` y no forman parte del ZIP. `scoop uninstall soma` retira la app y conserva esos datos.
 
-El preset Maven general usa el wrapper del proyecto y el objetivo `package`. Un `maven_adapter` explícito puede reemplazarlo para políticas locales. No distribuyas adaptadores de una PC ni ajustes de heap específicos de un backend como valores universales.
+El preset Maven general usa el wrapper del proyecto y el objetivo `package`. Un `maven_adapter` explícito puede reemplazarlo para políticas locales del runtime; `job_adapter` admite la política de trabajos independientes. No distribuyas adaptadores de una PC ni ajustes de heap específicos de un backend como valores universales.

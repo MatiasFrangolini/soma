@@ -47,7 +47,7 @@ pub fn request(store: &Store, request: &Value) -> std::result::Result<Value, Str
         .map_err(|e| e.to_string())?;
     serde_json::from_str(&result).map_err(|e| e.to_string())
 }
-pub fn serve(engine: Arc<Engine>) {
+pub fn serve(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>) {
     std::thread::spawn(move || unsafe {
         let mut descriptor = std::ptr::null_mut();
         let sddl = crate::wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)");
@@ -95,7 +95,7 @@ pub fn serve(engine: Arc<Engine>) {
             let mut line = String::new();
             let response = match reader.by_ref().take(65536).read_line(&mut line) {
                 Ok(_) => match serde_json::from_str::<Value>(&line) {
-                    Ok(value) => dispatch(&engine, &value),
+                    Ok(value) => dispatch(&engine, &jobs, &value),
                     Err(_) => crate::error("Solicitud JSON inválida"),
                 },
                 Err(_) => crate::error("No se pudo leer la solicitud"),
@@ -110,8 +110,18 @@ pub fn serve(engine: Arc<Engine>) {
         CloseHandle(handle);
     });
 }
-fn dispatch(engine: &Arc<Engine>, r: &Value) -> Value {
+fn dispatch(engine: &Arc<Engine>, jobs: &Arc<crate::jobs::Jobs>, r: &Value) -> Value {
     match r["command"].as_str().unwrap_or("") {
+        "job_submit" => match serde_json::from_value(r["request"].clone()) {
+            Ok(request) => jobs.submit(request),
+            Err(_) => crate::error("Solicitud de trabajo inválida"),
+        },
+        "job_status" => jobs.status(r["job"].as_str().unwrap_or("")),
+        "job_list" => jobs.list(),
+        "job_release" => jobs.release(r["job"].as_str().unwrap_or(""), r["participant"].as_str().unwrap_or("")),
+        "job_logs" => jobs.logs(r["job"].as_str().unwrap_or(""), r["tail"].as_u64().unwrap_or(200).min(2000) as usize),
+        "job_started" => jobs.started(r["job"].as_str().unwrap_or(""), r["token"].as_str().unwrap_or(""),
+            serde_json::from_value(r["args"].clone()).unwrap_or_default()),
         "status" => {
             json!({"ok":true,"status":engine.status(),"log_directory":engine.store.home.join("logs"),"config_file":engine.store.path()})
         }

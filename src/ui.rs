@@ -67,6 +67,7 @@ unsafe fn window_icons(window: HWND) {
 }
 struct Ui {
     engine: Arc<Engine>,
+    jobs: Arc<crate::jobs::Jobs>,
     settings: Settings,
     controls: BTreeMap<i32, HWND>,
     font: HFONT,
@@ -85,10 +86,11 @@ struct Ui {
     branches: Vec<String>,
 }
 impl Ui {
-    fn new(engine: Arc<Engine>) -> Self {
+    fn new(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>) -> Self {
         unsafe {
             Self {
                 engine,
+                jobs,
                 settings: Settings::default(),
                 controls: BTreeMap::new(),
                 font: std::ptr::null_mut(),
@@ -535,7 +537,7 @@ impl Ui {
             }
         }
         self.refreshing = false;
-        if self.closing && !busy {
+        if self.closing && !busy && !self.jobs.busy() {
             DestroyWindow(h);
         }
     }
@@ -780,6 +782,7 @@ unsafe extern "system" fn window_proc(h: HWND, msg: u32, w: usize, l: isize) -> 
         }
         WM_CLOSE | ipc::CLOSE => {
             ui.closing = true;
+            ui.jobs.shutdown();
             ui.engine.stop();
             ui.refresh(h);
             0
@@ -912,8 +915,16 @@ pub fn run() {
             }
             return;
         }
+        let jobs = match crate::jobs::Jobs::new(store.clone()) {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                MessageBoxW(std::ptr::null_mut(), wide(&error).as_ptr(), wide("Soma").as_ptr(), MB_ICONERROR);
+                CloseHandle(mutex);
+                return;
+            }
+        };
         let engine = Engine::new(store);
-        let ptr = Box::into_raw(Box::new(Ui::new(engine.clone())));
+        let ptr = Box::into_raw(Box::new(Ui::new(engine.clone(), jobs.clone())));
         let class = wide("SomaWindow");
         let instance = GetModuleHandleW(std::ptr::null());
         let wc = WNDCLASSW {
@@ -954,7 +965,7 @@ pub fn run() {
         let dark: i32 = 1;
         DwmSetWindowAttribute(h, 20, &dark as *const _ as _, 4);
         ipc::WINDOW.store(h as isize, Ordering::SeqCst);
-        ipc::serve(engine);
+        ipc::serve(engine, jobs);
         ShowWindow(h, SW_SHOW);
         UpdateWindow(h);
         let mut msg: MSG = std::mem::zeroed();

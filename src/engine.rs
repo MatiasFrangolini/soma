@@ -82,6 +82,8 @@ pub struct LogBook {
     dir: PathBuf,
     file: Option<File>,
     size: u64,
+    visible_limit: usize,
+    segment_limit: u64,
 }
 impl LogBook {
     pub fn new(dir: PathBuf) -> Self {
@@ -95,6 +97,8 @@ impl LogBook {
             dir,
             file: None,
             size,
+            visible_limit: VISIBLE,
+            segment_limit: DISK,
         };
         if let Ok(mut file) = File::open(book.dir.join("current.log")) {
             let _ = file.seek(SeekFrom::Start(size.saturating_sub((VISIBLE - 512) as u64)));
@@ -113,7 +117,7 @@ impl LogBook {
     }
     fn write_disk(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
         while !bytes.is_empty() {
-            if self.size >= DISK {
+            if self.size >= self.segment_limit {
                 self.file.take();
                 let _ = fs::remove_file(self.dir.join("previous-2.log"));
                 if self.dir.join("previous-1.log").exists() {
@@ -138,7 +142,7 @@ impl LogBook {
                         .open(self.dir.join("current.log"))?,
                 );
             }
-            let n = bytes.len().min((DISK - self.size) as usize);
+            let n = bytes.len().min((self.segment_limit - self.size) as usize);
             self.file.as_mut().unwrap().write_all(&bytes[..n])?;
             self.size += n as u64;
             bytes = &bytes[n..];
@@ -155,7 +159,7 @@ impl LogBook {
     fn push(&mut self, text: String) {
         self.bytes += text.len();
         self.text.push_back(text);
-        while self.bytes > VISIBLE {
+        while self.bytes > self.visible_limit {
             if let Some(s) = self.text.pop_front() {
                 self.bytes -= s.len();
             } else {
@@ -186,14 +190,42 @@ struct Stamp {
     artifact_hash: Option<String>,
     built_at: u64,
 }
+struct SnapshotFile(PathBuf);
+impl Drop for SnapshotFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+        if let Some(directory) = self.0.parent() { let _ = fs::remove_dir(directory); }
+    }
+}
 impl Engine {
     pub fn new(store: Store) -> Arc<Self> {
+        // Called only by the owner after acquiring its data-directory mutex.
+        if let Ok(entries) = fs::read_dir(store.home.join("runs")) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !name.is_empty() && name.bytes().all(|c|c.is_ascii_digit() || c == b'-') {
+                    let _ = fs::remove_file(entry.path().join("application.jar"));
+                    let _ = fs::remove_dir(entry.path());
+                }
+            }
+        }
         Arc::new(Self {
             logs: Arc::new(Mutex::new(LogBook::new(store.home.join("logs")))),
             store,
             state: Mutex::new(Status::default()),
             cancel: Mutex::new(None),
         })
+    }
+    pub(crate) fn finite(store: Store) -> Arc<Self> {
+        let mut logs = LogBook::new(store.home.join("logs"));
+        logs.visible_limit = 64 * 1024;
+        logs.segment_limit = 1024 * 1024;
+        Arc::new(Self { logs: Arc::new(Mutex::new(logs)), store,
+            state: Mutex::new(Status::default()), cancel: Mutex::new(None) })
+    }
+    pub(crate) fn execute_finite(&self, command: CommandSpec, env: &BTreeMap<String, String>,
+        cancel: &Arc<AtomicBool>) -> Result<u32> {
+        self.execute(command, env, cancel, None)
     }
     pub fn status(&self) -> Status {
         self.state.lock().unwrap().clone()
@@ -317,7 +349,10 @@ impl Engine {
         mode: &str,
         cancel: &Arc<AtomicBool>,
     ) -> Result<u32> {
-        let _lease = crate::git::CheckoutLease::acquire(&p.directory)?;
+        let _runtime = if mode != "build" {
+            Some(crate::git::CheckoutLease::runtime(&p.directory)?)
+        } else { None };
+        let mut checkout = Some(crate::git::CheckoutLease::acquire(&p.directory)?);
         // Snapshot the checkout only after other Soma owners can no longer switch it.
         let branch = model::branch(&p.directory);
         let head = crate::git::head(&p.directory);
@@ -411,15 +446,34 @@ impl Engine {
         if cancel.load(Ordering::SeqCst) {
             return Ok(0);
         }
+        let mut snapshot_file = None;
         let run = match &c.run {
             RunSpec::JavaJar {
                 artifact,
+                snapshot,
                 jvm_args,
                 args,
             } => {
-                let path = model::resolve(p, artifact);
+                let mut path = model::resolve(p, artifact);
                 if !path.is_file() {
                     return Err("El JAR configurado no existe".into());
+                }
+                if *snapshot {
+                    let id = self.status().operation_id.ok_or("Falta identidad de ejecución")?;
+                    let directory = self.store.home.join("runs").join(id);
+                    fs::create_dir_all(&directory).map_err(|e| e.to_string())?;
+                    let copy = directory.join("application.jar");
+                    snapshot_file = Some(SnapshotFile(copy.clone()));
+                    fs::copy(&path, &copy).map_err(|e| e.to_string())?;
+                    if model::hash_file(&path)? != model::hash_file(&copy)? {
+                        let _ = fs::remove_file(&copy);
+                        let _ = fs::remove_dir(&directory);
+                        return Err("El JAR cambió al preparar la copia de ejecución".into());
+                    }
+                    path = copy.clone();
+                    // The runtime lease still protects Git and other application starts.
+                    checkout.take();
+                    self.note("JAR autocontenido aislado; los trabajos pueden usar el checkout");
                 }
                 let java = if let Some(jdk) = &c.jdk {
                     model::resolve(p, jdk)
@@ -456,7 +510,9 @@ impl Engine {
             "not_configured"
         }
         .into();
-        self.execute(run, &env, cancel, c.readiness.as_ref())
+        let result = self.execute(run, &env, cancel, c.readiness.as_ref());
+        drop(snapshot_file);
+        result
     }
     fn execute(
         &self,
@@ -609,6 +665,7 @@ impl Engine {
             return json!({"ok":false,"code":"busy","error":"Detené la ejecución antes de cambiar de rama"});
         }
         let result = self.store.target(project, None, directory).and_then(|(p,_)| {
+            let _runtime = crate::git::CheckoutLease::runtime(&p.directory)?;
             let _lease = crate::git::CheckoutLease::acquire(&p.directory)?;
             crate::git::switch(&p.directory, branch)?;
             Ok(json!({"ok":true,"directory":p.directory,"branch":model::branch(&p.directory),"head":crate::git::head(&p.directory)}))

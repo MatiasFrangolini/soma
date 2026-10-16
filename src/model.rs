@@ -17,6 +17,8 @@ pub struct Settings {
     pub projects: Vec<Project>,
     #[serde(default)]
     pub maven_adapter: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job_adapter: Option<CommandSpec>,
 }
 fn version() -> u32 {
     1
@@ -30,6 +32,42 @@ pub struct Project {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_worktree: Option<PathBuf>,
     pub configs: Vec<Config>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub test_configs: Vec<TestConfig>,
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestConfig {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub env_file: Option<String>,
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub jdk: Option<String>,
+    #[serde(default = "default_inputs")]
+    pub inputs: Vec<String>,
+    #[serde(default)]
+    pub input_excludes: Vec<String>,
+}
+impl TestConfig {
+    pub fn context(&self) -> Config {
+        Config {
+            id: self.id.clone(),
+            name: self.name.clone(),
+            env_file: self.env_file.clone(),
+            env: self.env.clone(),
+            jdk: self.jdk.clone(),
+            inputs: self.inputs.clone(),
+            input_excludes: self.input_excludes.clone(),
+            profiles: vec![],
+            config_files: vec![],
+            build: None,
+            run: RunSpec::Command { executable: "mvnw.cmd".into(), args: vec![] },
+            readiness: None,
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -73,6 +111,8 @@ pub struct CommandSpec {
 pub enum RunSpec {
     JavaJar {
         artifact: String,
+        #[serde(default)]
+        snapshot: bool,
         #[serde(default)]
         jvm_args: Vec<String>,
         #[serde(default)]
@@ -201,6 +241,13 @@ impl Store {
                 return Err(format!("{}: directory debe ser absoluto", p.id));
             }
             let mut configs = std::collections::HashSet::new();
+            let mut test_configs = std::collections::HashSet::new();
+            for config in &p.test_configs {
+                validate_id(&config.id)?;
+                if !test_configs.insert(config.id.clone()) {
+                    return Err("ID de configuración de pruebas duplicado".into());
+                }
+            }
             for c in &p.configs {
                 validate_id(&c.id)?;
                 if !configs.insert(c.id.clone()) {
@@ -432,6 +479,7 @@ impl Store {
                 build,
                 run: RunSpec::JavaJar {
                     artifact: jar,
+                    snapshot: false,
                     jvm_args: vec![],
                     args: vec![],
                 },
@@ -440,12 +488,18 @@ impl Store {
                 readiness: None,
             });
         }
+        let test_configs = if dir.join("pom.xml").is_file() {
+            vec![TestConfig { id: "tests".into(), name: "Tests".into(), env_file: None,
+                env: BTreeMap::new(), jdk: configs.first().and_then(|c| c.jdk.clone()),
+                inputs: default_inputs(), input_excludes: vec![] }]
+        } else { vec![] };
         s.projects.push(Project {
             id: id.clone(),
             name,
             directory: dir,
             selected_worktree: None,
             configs,
+            test_configs,
         });
         self.save(&s)?;
         Ok(id)

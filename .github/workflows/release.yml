@@ -33,6 +33,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build --locked --release --jobs 1 --target x86_64-pc-windows-gnu
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --jobs 1 --target x86_64-pc-windows-gnu
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           foreach ($exe in @('Soma.exe', 'soma-cli.exe')) {
             $imports = & (Join-Path $bin 'objdump.exe') -p (Join-Path './target/x86_64-pc-windows-gnu/release' $exe)
             if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -56,6 +58,9 @@ jobs:
       - name: Checkout and readiness contracts
         shell: pwsh
         run: ./tests/targets.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-targets-qa') -Jdk $env:JAVA_HOME_21_X64
+      - name: Independent Maven job contracts
+        shell: pwsh
+        run: ./tests/jobs.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-jobs-qa') -Jdk $env:JAVA_HOME_21_X64
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: soma-windows-release

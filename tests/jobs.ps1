@@ -140,4 +140,3 @@ try{
     Assert (@($retained).Count -eq 100 -and ($allLogs|Measure-Object Length -Sum).Sum -le 30MB) 'Completed history prunes to 100 jobs and the total job log budget stays bounded'
     [ordered]@{Result='PASS';Checks=@($checks.ToArray());IdleWorkingSetMiB=[Math]::Round($loadedIdle/1MB,2);ReopenedWorkingSetMiB=[Math]::Round($idle/1MB,2);SampleTimings=$timing;Data=$data}|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $Workspace 'jobs-verification.json')
 }finally{$null=Invoke-JobCli @('close')}
-

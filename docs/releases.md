@@ -1,6 +1,6 @@
 # Releases
 
-El repositorio incluye fuente Rust, icono, pruebas, empaquetado y bucket de Scoop. Los datos personales viven fuera de las versiones instaladas. El ZIP incluye exclusivamente los ejecutables, README, guía para agentes, licencia e información de versión/hash.
+El repositorio incluye fuente Rust, icono, pruebas, empaquetado y bucket de Scoop. Los datos personales viven fuera de las versiones instaladas. El ZIP incluye exclusivamente los ejecutables, README, guía para agentes, licencia, guía de portabilidad, preset JVM público e información de versión/hash.
 
 Para publicar una versión:
 
@@ -14,4 +14,4 @@ Si una ejecución falla, resolvé su causa y publicá una versión nueva. No sob
 
 Los usuarios cierran Soma y ejecutan `soma-update`. Scoop comprueba el hash, conserva las versiones según sus reglas y actualiza los shims y el acceso del menú Inicio. Los proyectos, logs y parámetros JVM están en `%USERPROFILE%\.soma` y no forman parte del ZIP. `scoop uninstall soma` retira la app y conserva esos datos.
 
-El preset Maven general usa el wrapper del proyecto y el objetivo `package`. Un `maven_adapter` explícito puede reemplazarlo para políticas locales del runtime; `job_adapter` admite la política de trabajos independientes. No distribuyas adaptadores de una PC ni ajustes de heap específicos de un backend como valores universales.
+El preset Maven general usa el wrapper del proyecto y el objetivo `package`. `JVM optimizada` es una configuración opcional y portable con límites documentados en `docs/portability.md`. Un `maven_adapter` explícito puede reemplazar el build para políticas locales del runtime; `job_adapter` admite la política de trabajos independientes. Distribuí únicamente el preset público; los adaptadores personales, `projects.json` y datos de un backend quedan fuera del paquete.

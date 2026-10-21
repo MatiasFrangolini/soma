@@ -5,6 +5,8 @@ pub mod ipc;
 pub mod jobs;
 pub mod jobs_cli;
 pub mod model;
+pub mod observation;
+pub mod owner;
 pub mod readiness;
 pub mod reports;
 pub mod ui;

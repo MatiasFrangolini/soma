@@ -1,18 +1,18 @@
 use crate::{
     engine::Engine,
     ipc,
-    model::{Settings, Store},
+    model::Settings,
     wide,
 };
 use std::{
     collections::BTreeMap,
     path::PathBuf,
-    sync::{atomic::Ordering, Arc},
+    sync::{atomic::Ordering, Arc, Mutex},
 };
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::{Dwm::DwmSetWindowAttribute, Gdi::*},
-    System::{Com::*, LibraryLoader::GetModuleHandleW, Threading::CreateMutexW},
+    System::{Com::*, LibraryLoader::GetModuleHandleW},
     UI::{Controls::*, HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
 
@@ -68,6 +68,7 @@ unsafe fn window_icons(window: HWND) {
 struct Ui {
     engine: Arc<Engine>,
     jobs: Arc<crate::jobs::Jobs>,
+    owner: Arc<Mutex<crate::owner::Control>>,
     settings: Settings,
     controls: BTreeMap<i32, HWND>,
     font: HFONT,
@@ -86,11 +87,12 @@ struct Ui {
     branches: Vec<String>,
 }
 impl Ui {
-    fn new(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>) -> Self {
+    fn new(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>, owner: Arc<Mutex<crate::owner::Control>>) -> Self {
         unsafe {
             Self {
                 engine,
                 jobs,
+                owner,
                 settings: Settings::default(),
                 controls: BTreeMap::new(),
                 font: std::ptr::null_mut(),
@@ -773,6 +775,7 @@ unsafe extern "system" fn window_proc(h: HWND, msg: u32, w: usize, l: isize) -> 
             0
         }
         WM_TIMER => {
+            if ui.owner.lock().unwrap().closing { ui.closing = true; }
             ui.refresh(h);
             0
         }
@@ -781,6 +784,7 @@ unsafe extern "system" fn window_proc(h: HWND, msg: u32, w: usize, l: isize) -> 
             0
         }
         WM_CLOSE | ipc::CLOSE => {
+            ui.owner.lock().unwrap().closing = true;
             ui.closing = true;
             ui.jobs.shutdown();
             ui.engine.stop();
@@ -892,38 +896,11 @@ unsafe extern "system" fn window_proc(h: HWND, msg: u32, w: usize, l: isize) -> 
         _ => DefWindowProcW(h, msg, w, l),
     }
 }
-pub fn run() {
+pub(crate) fn run(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>, owner: Arc<Mutex<crate::owner::Control>>) {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
-        let store = Store::from_args();
-        // Check ownership before touching history or configuration. A restricted caller
-        // may see the data directory but cannot open an existing owner's mutex.
-        let mutex_name = wide(&format!("Local\\{}", ipc::name(&store).replace('\\', "-")));
-        let mutex = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
-        if mutex.is_null() {
-            return;
-        }
-        if GetLastError() == ERROR_ALREADY_EXISTS {
-            let _ = ipc::request(&store, &serde_json::json!({"command":"show"}));
-            CloseHandle(mutex);
-            return;
-        }
-        if let Err(e) = store.initialize() {
-            startup_error(&e);
-            CloseHandle(mutex);
-            return;
-        }
-        let jobs = match crate::jobs::Jobs::new(store.clone()) {
-            Ok(jobs) => jobs,
-            Err(error) => {
-                startup_error(&error);
-                CloseHandle(mutex);
-                return;
-            }
-        };
-        let engine = Engine::new(store);
-        let ptr = Box::into_raw(Box::new(Ui::new(engine.clone(), jobs.clone())));
+        let ptr = Box::into_raw(Box::new(Ui::new(engine.clone(), jobs.clone(), owner)));
         let class = wide("SomaWindow");
         let instance = GetModuleHandleW(std::ptr::null());
         let wc = WNDCLASSW {
@@ -952,14 +929,12 @@ pub fn run() {
         if h.is_null() {
             startup_error(&std::io::Error::last_os_error().to_string());
             drop(Box::from_raw(ptr));
-            CloseHandle(mutex);
             return;
         }
         window_icons(h);
         let dark: i32 = 1;
         DwmSetWindowAttribute(h, 20, &dark as *const _ as _, 4);
         ipc::WINDOW.store(h as isize, Ordering::SeqCst);
-        ipc::serve(engine, jobs);
         ShowWindow(h, SW_SHOW);
         UpdateWindow(h);
         let mut msg: MSG = std::mem::zeroed();
@@ -970,16 +945,13 @@ pub fn run() {
             }
         }
         drop(Box::from_raw(ptr));
-        if !mutex.is_null() {
-            CloseHandle(mutex);
-        }
         CoUninitialize();
     }
 }
 
-unsafe fn startup_error(error: &str) {
+pub(crate) fn startup_error(error: &str) {
     // CLI callers receive a JSON connection error; never leave them waiting on a modal dialog.
     if !std::env::args().any(|arg| arg == "--cli-owner") {
-        MessageBoxW(std::ptr::null_mut(), wide(error).as_ptr(), wide("Soma").as_ptr(), MB_ICONERROR);
+        unsafe { MessageBoxW(std::ptr::null_mut(), wide(error).as_ptr(), wide("Soma").as_ptr(), MB_ICONERROR); }
     }
 }

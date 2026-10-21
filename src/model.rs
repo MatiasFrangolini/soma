@@ -97,6 +97,34 @@ pub struct Config {
 fn default_inputs() -> Vec<String> {
     vec![".".into()]
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JavaPreset {
+    pub id: String,
+    pub name: String,
+    pub jvm_args: Vec<String>,
+}
+impl JavaPreset {
+    pub fn optimized() -> Result<Self> {
+        serde_json::from_str(include_str!("../presets/jvm-optimized.json"))
+            .map_err(|e| format!("Preset JVM integrado inválido: {e}"))
+    }
+    fn configure(&self, mut source: Config) -> Result<Config> {
+        let RunSpec::JavaJar { jvm_args, .. } = &mut source.run else {
+            return Err("El preset JVM requiere una configuración java_jar".into());
+        };
+        source.id = self.id.clone();
+        source.name = self.name.clone();
+        jvm_args.retain(|arg| ![
+            "-Xms", "-Xmx", "-XX:InitialHeapSize=", "-XX:MaxHeapSize=", "-XX:MinHeapSize=",
+            "-XX:MinHeapFreeRatio=", "-XX:MaxHeapFreeRatio=", "-XX:G1PeriodicGCInterval=",
+            "-XX:+UseG1GC", "-XX:-UseG1GC", "-XX:+UseSerialGC", "-XX:+UseParallelGC",
+            "-XX:+UseZGC", "-XX:+UseShenandoahGC", "-XX:+UseEpsilonGC",
+        ].iter().any(|prefix| arg.starts_with(prefix)));
+        jvm_args.extend(self.jvm_args.clone());
+        Ok(source)
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CommandSpec {
@@ -264,6 +292,21 @@ impl Store {
         let temp = self.home.join("projects.json.tmp");
         fs::write(&temp, serde_json::to_vec_pretty(value).unwrap()).map_err(|e| e.to_string())?;
         fs::rename(temp, self.path()).map_err(|e| e.to_string())
+    }
+    pub fn apply_preset(&self, project: &str, preset: &str, from: Option<&str>) -> Result<bool> {
+        let preset_config = JavaPreset::optimized()?;
+        if preset != preset_config.id { return Err("Preset no encontrado; usá presets".into()); }
+        let mut settings = self.load()?;
+        let project = settings.projects.iter_mut().find(|p| p.id == project)
+            .ok_or("Proyecto no encontrado")?;
+        if project.configs.iter().any(|c| c.id == preset) { return Ok(false); }
+        let source = project.configs.iter().find(|c| match from {
+            Some(id) => c.id == id,
+            None => matches!(c.run, RunSpec::JavaJar { .. }),
+        }).ok_or("No se encontró la configuración Java de origen")?.clone();
+        project.configs.push(preset_config.configure(source)?);
+        self.save(&settings)?;
+        Ok(true)
     }
     pub fn find(&self, project: &str, config: Option<&str>) -> Result<(Project, Config)> {
         let s = self.load()?;
@@ -452,22 +495,7 @@ impl Store {
                 });
             let jdk = std::env::var_os("JAVA_HOME")
                 .map(PathBuf::from)
-                .filter(|p| p.join("bin/java.exe").is_file())
-                .or_else(|| {
-                    std::env::var_os("USERPROFILE")
-                        .map(PathBuf::from)
-                        .and_then(|h| fs::read_dir(h.join(".jdks")).ok())
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .map(|e| e.path())
-                        .find(|p| {
-                            p.file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .starts_with("ms-21")
-                        })
-                });
+                .filter(|p| p.join("bin/java.exe").is_file());
             configs.push(Config {
                 id: "local".into(),
                 name: "Local".into(),
@@ -487,6 +515,7 @@ impl Store {
                 input_excludes: vec![],
                 readiness: None,
             });
+            configs.push(JavaPreset::optimized()?.configure(configs[0].clone())?);
         }
         let test_configs = if dir.join("pom.xml").is_file() {
             vec![TestConfig { id: "tests".into(), name: "Tests".into(), env_file: None,

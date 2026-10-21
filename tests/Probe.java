@@ -21,7 +21,8 @@ public class Probe {
             int port = Integer.parseInt(args[1]);
             HttpServer server = HttpServer.create(mode.equals("http-wildcard") ? new InetSocketAddress(port) : new InetSocketAddress("127.0.0.1", port), 0);
             server.createContext("/health", exchange -> {
-                boolean ready = !mode.equals("down") && System.nanoTime() >= readyAt;
+                boolean ready = !mode.equals("down") && !Files.exists(Path.of("health-down.flag")) && System.nanoTime() >= readyAt;
+                System.out.println("HEALTH_REQUEST");
                 byte[] body = ("{\"status\":\"" + (ready ? "UP" : "DOWN") + "\"}").getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 exchange.getResponseHeaders().set("Content-Type", "application/json");
                 exchange.sendResponseHeaders(200, body.length);

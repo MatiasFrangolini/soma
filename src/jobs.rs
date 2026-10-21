@@ -653,6 +653,7 @@ impl Jobs {
     }
     pub fn busy(&self) -> bool {
         self.preparing.load(Ordering::SeqCst) || self.executing.load(Ordering::SeqCst)
+            || self.state.lock().unwrap().entries.values().any(|entry| !terminal(&entry.record.state))
     }
     fn prepare_loop(self: Arc<Self>) {
         loop {

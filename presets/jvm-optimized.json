@@ -1,0 +1,12 @@
+{
+  "id": "jvm-optimized",
+  "name": "JVM optimizada",
+  "jvm_args": [
+    "-XX:+UseG1GC",
+    "-Xms64m",
+    "-Xmx768m",
+    "-XX:MinHeapFreeRatio=10",
+    "-XX:MaxHeapFreeRatio=20",
+    "-XX:G1PeriodicGCInterval=30000"
+  ]
+}

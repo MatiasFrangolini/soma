@@ -56,6 +56,7 @@ foreach($path in @($data,$otherData)){$settings|ConvertTo-Json -Depth 15|Set-Con
 $foreign=$null
 try{
     Assert ((Invoke-TargetRunner @('validate')).Value.ok) 'Existing configuration shape remains valid with optional readiness'
+    Assert ((Invoke-TargetRunner @('show')).Value.ok) 'Explicit show keeps the fixture interface available for native control checks'
     $trees=(Invoke-TargetRunner @('worktrees','--path',$main)).Value
     Assert (@($trees.worktrees).Count -eq 2 -and @($trees.branches).Contains('fixture-feature')) 'Git discovers both actual worktrees and selectable local branches'
     $built=Invoke-TargetRunner @('build','--path',$main,'--config','http','--wait')
@@ -93,6 +94,20 @@ try{
     $again=Invoke-TargetRunner @('run','--path',$linked,'--config','http','--wait-ready','--timeout','30')
     Assert ($again.Code -eq 0 -and $again.Value.status.readiness -eq 'ready') 'Run --wait-ready provides the same readiness contract'
     $newOperation=$again.Value.status.operation_id
+    $baseline=Invoke-TargetRunner @('logs','--operation',$newOperation,'--tail','0')
+    Assert ($baseline.Value.ok -and $baseline.Value.operation.directory -eq $linked -and -not $baseline.Value.historical) 'Logs identify the exact active operation and worktree'
+    $observed=Invoke-TargetRunner @('status','--operation',$newOperation,'--health')
+    Assert ($observed.Value.health.state -eq 'healthy' -and $observed.Value.health.checked_now -and $observed.Value.status.readiness_checked_at_ms) 'Explicit health checks probe the owned endpoint now and timestamp startup evidence separately'
+    $delta=Invoke-TargetRunner @('logs','--operation',$newOperation,'--after',$baseline.Value.cursor,'--contains','HEALTH_REQUEST')
+    Assert ($delta.Value.ok -and $delta.Value.text.Contains('HEALTH_REQUEST') -and -not $delta.Value.text.Contains('PARENT_PID')) 'Incremental filtered logs contain new request evidence without replaying startup'
+    Set-Content (Join-Path $linked 'health-down.flag') 'down'
+    try{
+        $cached=Invoke-TargetRunner @('status','--operation',$newOperation)
+        Assert ($cached.Value.status.readiness -eq 'ready' -and $cached.Value.health.state -eq 'not_checked') 'Ordinary status never presents startup readiness as a current health check'
+        $unhealthy=Invoke-TargetRunner @('status','--operation',$newOperation,'--health')
+        Assert ($unhealthy.Value.health.state -eq 'unhealthy' -and $unhealthy.Value.status.state -eq 'running' -and $unhealthy.Value.status.operation_id -eq $newOperation) 'A newly unhealthy API is reported without stopping or restarting its execution'
+    }finally{Remove-Item -LiteralPath (Join-Path $linked 'health-down.flag') -ErrorAction SilentlyContinue}
+    Assert ((Invoke-TargetRunner @('status','--operation',$operation,'--health')).Code -eq 7) 'A stale operation cannot silently inspect the replacement backend'
     Assert ((Invoke-TargetRunner @('stop','--operation',$operation)).Code -eq 7 -and (State).operation_id -eq $newOperation) 'A stale ID cannot stop a later execution of the same project'
     Stop-Owned $newOperation
     $down=Invoke-TargetRunner @('run','--path',$linked,'--config','down','--wait-ready','--timeout','20')
@@ -104,6 +119,8 @@ try{
     $normal=Invoke-TargetRunner @('run','--path',$linked,'--config','normal','--wait-ready','--timeout','20')
     Assert ($normal.Code -eq 8 -and $normal.Value.status.state -eq 'running') 'Readiness without a configured endpoint returns an explicit error'
     Stop-Owned $normal.Value.status.operation_id
+    $notRunning=Invoke-TargetRunner @('status','--operation',$normal.Value.status.operation_id,'--health')
+    Assert ($notRunning.Value.health.state -eq 'not_running' -and -not $notRunning.Value.health.checked_now) 'Stopped executions do not reuse a historical healthy response'
     $exited=Invoke-TargetRunner @('run','--path',$linked,'--config','exit','--wait-ready','--timeout','20')
     Assert ($exited.Code -eq 5) 'An exit code zero before readiness is not mistaken for a ready server'
     $info=[Diagnostics.ProcessStartInfo]::new((Join-Path $Jdk 'bin/java.exe'))
@@ -115,6 +132,7 @@ try{
     Assert ($health.status -eq 'UP') 'An independent healthy server exists for the ownership negative control'
     $notOwned=Invoke-TargetRunner @('run','--path',$linked,'--config','foreign','--wait-ready','--timeout','20')
     Assert ($notOwned.Code -eq 9 -and $notOwned.Value.status.readiness -eq 'timed_out') 'A healthy listener owned by another process cannot satisfy readiness'
+    Assert ((Invoke-TargetRunner @('status','--operation',$notOwned.Value.status.operation_id,'--health')).Value.health.state -eq 'unhealthy') 'On-demand health also rejects a healthy listener outside the execution tree'
     Stop-Owned $notOwned.Value.status.operation_id
     $foreign.Refresh();Assert (-not $foreign.HasExited) 'Owned Stop leaves the independent HTTP server alive'
     $otherProject=Join-Path $Workspace 'unrelated folder';New-Item -ItemType Directory -Force -Path $otherProject|Out-Null
@@ -190,6 +208,13 @@ public static class SomaTargetUi {
     }while([DateTime]::UtcNow -lt $deadline)
     Assert ($text.ToString() -eq 'normal') 'Native profile selector follows a CLI execution even when its checkout stays the same'
     Stop-Owned $profile.Value.status.operation_id
+    $null=Invoke-TargetRunner @('close')
+    $deadline=[DateTime]::UtcNow.AddSeconds(20)
+    do{$closed=Invoke-TargetRunner @('status');if($closed.Value.status.state -eq 'closed'){break};Start-Sleep -Milliseconds 100}while([DateTime]::UtcNow -lt $deadline)
+    Assert ($closed.Value.owner.state -eq 'absent' -and $closed.Value.execution_state -eq 'unknown' -and $closed.Value.last_known_operation.operation_id -eq $profile.Value.status.operation_id) 'An absent owner is distinct from an observed process exit and retains historical identity'
+    $offline=Invoke-TargetRunner @('logs','--operation',$newOperation,'--after',$baseline.Value.cursor)
+    Assert ($offline.Value.ok -and $offline.Value.source -eq 'disk' -and $offline.Value.historical -and $offline.Value.operation.directory -eq $linked) 'The same operation-scoped cursor remains readable offline without launching Soma'
+    Assert (-not (Invoke-TargetRunner @('status','--operation',$newOperation,'--health')).Value.ok -and (Invoke-TargetRunner @('status')).Value.owner.state -eq 'absent') 'Offline health explicitly fails without opening or restarting an owner'
     [ordered]@{Result='PASS';Checks=@($checks.ToArray());Main=$main;Linked=$linked;Data=$data;Jdk=$Jdk}|ConvertTo-Json -Depth 6|Set-Content (Join-Path $Workspace 'targets-verification.json')
 }catch{
     $failure=$_

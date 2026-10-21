@@ -10,13 +10,16 @@ New-Item -ItemType Directory -Path $output -Force|Out-Null
 $stage=Join-Path $output ('.stage-'+[guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $stage|Out-Null
 foreach($name in @('Soma.exe','soma-cli.exe')){Copy-Item -LiteralPath (Join-Path $BinaryDirectory $name) -Destination (Join-Path $stage $name)}
-foreach($name in @('README.md','AGENTS.md','LICENSE')){Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $stage $name)}
+foreach($name in @('README.md','CLI.md','AGENTS.md','LICENSE')){Copy-Item -LiteralPath (Join-Path $root $name) -Destination (Join-Path $stage $name)}
 Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Update-Soma.ps1') -Destination (Join-Path $stage 'Update-Soma.ps1')
+New-Item -ItemType Directory -Path (Join-Path $stage 'presets')|Out-Null
+Copy-Item -LiteralPath (Join-Path $root 'presets/jvm-optimized.json') -Destination (Join-Path $stage 'presets/jvm-optimized.json')
+Copy-Item -LiteralPath (Join-Path $root 'docs/portability.md') -Destination (Join-Path $stage 'PORTABILITY.md')
 $files=@(foreach($name in @('Soma.exe','soma-cli.exe')){$path=Join-Path $stage $name;[ordered]@{name=$name;sha256=(Get-FileHash -LiteralPath $path).Hash.ToLowerInvariant()}})
 @{version=$version;architecture='x64';files=$files}|ConvertTo-Json -Depth 5|Set-Content -LiteralPath (Join-Path $stage 'build-info.json') -Encoding utf8NoBOM
 $filename="Soma-$version-windows-x64.zip"
 $zip=Join-Path $output $filename
-Compress-Archive -LiteralPath @((Get-ChildItem -LiteralPath $stage -File).FullName) -DestinationPath $zip -Force
+Compress-Archive -LiteralPath @((Get-ChildItem -LiteralPath $stage).FullName) -DestinationPath $zip -Force
 $hash=(Get-FileHash -LiteralPath $zip).Hash.ToLowerInvariant()
 Set-Content -LiteralPath (Join-Path $output 'SHA256SUMS') -Value "$hash  $filename" -Encoding ascii
 $guard=@(

@@ -48,5 +48,14 @@ Resultado de una compilación exitosa que todavía corresponde a las entradas y 
 **Logs de ejecución**:
 Salida de una aplicación durante su ejecución.
 
+**Observación**:
+Lectura fechada de estado, logs o salud sin iniciar ni reemplazar una ejecución. La falta de comunicación con Soma no establece el estado de aplicaciones externas.
+
+**Cursor de logs**:
+Punto de lectura incremental ligado al historial de una instancia y a una ejecución o lectura global. Puede vencer por retención; no identifica por sí solo un backend activo.
+
+**Salud actual**:
+Resultado de consultar explícitamente el endpoint configurado y perteneciente a la ejecución. Es diferente de la evidencia de readiness obtenida durante el arranque.
+
 **Logs de trabajo**:
 Salida producida durante una compilación o validación finita.

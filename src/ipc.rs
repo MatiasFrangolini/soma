@@ -7,7 +7,7 @@ use std::{
     os::windows::io::{FromRawHandle, IntoRawHandle},
     sync::{
         atomic::{AtomicIsize, Ordering},
-        Arc,
+        Arc, Mutex,
     },
 };
 use windows_sys::Win32::{
@@ -87,24 +87,25 @@ pub fn request(store: &Store, request: &Value) -> Result<Value, RequestError> {
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e).into())
 }
 pub fn request_or_launch(store: &Store, request: &Value) -> Result<Value, RequestError> {
-    match self::request(store, request) {
-        Ok(value) => return Ok(value),
-        Err(error) if error.is_absent() => {},
-        Err(error) => return Err(error),
-    }
-    let exe = std::env::current_exe()?.with_file_name("Soma.exe");
-    crate::launch_windowed(&exe, &format!("--cli-owner --data-dir \"{}\"", store.home.display()))?;
+    let mut launched = false;
     for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(75));
         match self::request(store, request) {
+            Ok(value) if value["code"] == "owner_closing" => { launched = false; },
             Ok(value) => return Ok(value),
-            Err(error) if error.is_absent() => {},
+            Err(error) if error.is_absent() => {
+                if !launched {
+                    let exe = std::env::current_exe()?.with_file_name("Soma.exe");
+                    crate::launch_windowed(&exe, &format!("--cli-owner --data-dir \"{}\"", store.home.display()))?;
+                    launched = true;
+                }
+            },
             Err(error) => return Err(error),
         }
+        std::thread::sleep(std::time::Duration::from_millis(75));
     }
     Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Soma no pudo abrir su canal local").into())
 }
-pub fn serve(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>) {
+pub(crate) fn serve(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>, control: Arc<Mutex<crate::owner::Control>>) {
     std::thread::spawn(move || unsafe {
         let mut descriptor = std::ptr::null_mut();
         let sddl = crate::wide("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;OW)");
@@ -150,9 +151,29 @@ pub fn serve(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>) {
             let file = File::from_raw_handle(handle);
             let mut reader = BufReader::new(file);
             let mut line = String::new();
-            let response = match reader.by_ref().take(65536).read_line(&mut line) {
+            let read = reader.by_ref().take(65536).read_line(&mut line);
+            let mut owner = control.lock().unwrap();
+            let response = match read {
                 Ok(_) => match serde_json::from_str::<Value>(&line) {
-                    Ok(value) => dispatch(&engine, &jobs, &value),
+                    Ok(value) => {
+                        let command = value["command"].as_str().unwrap_or("");
+                        let mutation = matches!(command, "start_target" | "run" | "build" | "reuse" | "restart" | "switch" | "job_submit" | "show");
+                        let mut result = if owner.closing && mutation {
+                            json!({"ok":false,"code":"owner_closing","error":"Soma está cerrando su instancia temporal"})
+                        } else {
+                            if mutation { owner.last_busy = std::time::Instant::now(); }
+                            if command == "show" { owner.interactive = true; }
+                            if command == "close" {
+                                owner.closing = true;
+                                jobs.shutdown();
+                                engine.stop();
+                            }
+                            dispatch(&engine, &jobs, &value)
+                        };
+                        result["owner"]["pid"] = json!(std::process::id());
+                        result["owner"]["temporary"] = json!(!owner.interactive);
+                        result
+                    },
                     Err(_) => crate::error("Solicitud JSON inválida"),
                 },
                 Err(_) => crate::error("No se pudo leer la solicitud"),
@@ -163,6 +184,7 @@ pub fn serve(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>) {
             let raw = file.into_raw_handle();
             FlushFileBuffers(raw);
             DisconnectNamedPipe(raw);
+            drop(owner);
         }
         CloseHandle(handle);
     });
@@ -180,15 +202,12 @@ fn dispatch(engine: &Arc<Engine>, jobs: &Arc<crate::jobs::Jobs>, r: &Value) -> V
         "job_started" => jobs.started(r["job"].as_str().unwrap_or(""), r["token"].as_str().unwrap_or(""),
             serde_json::from_value(r["args"].clone()).unwrap_or_default()),
         "status" => {
-            json!({"ok":true,"status":engine.status(),"log_directory":engine.store.home.join("logs"),"config_file":engine.store.path()})
+            engine.observe_status(r)
         }
         "logs" => {
+            let status = engine.state.lock().unwrap();
             let logs = engine.logs.lock().unwrap();
-            let text = logs.snapshot();
-            let count = r["tail"].as_u64().unwrap_or(200).min(20000) as usize;
-            let mut lines = text.lines().rev().take(count).collect::<Vec<_>>();
-            lines.reverse();
-            json!({"ok":true,"text":lines.join("\n"),"generation":logs.generation,"visible_bytes":logs.bytes,"directory":engine.store.home.join("logs")})
+            logs.observe(r, &status)
         }
         "run" | "build" | "reuse" => engine.start(
             r["project"].as_str().unwrap_or(""),

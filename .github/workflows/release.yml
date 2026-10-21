@@ -55,9 +55,12 @@ jobs:
       - name: Process contracts
         shell: pwsh
         run: ./tests/verify.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-process-qa') -Jdk $env:JAVA_HOME_21_X64
+      - name: CLI owner lifecycle contracts
+        shell: pwsh
+        run: ./tests/lifecycle.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-lifecycle-qa')
       - name: Distribution contracts
         shell: pwsh
-        run: ./tests/distribution.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-distribution-qa') -Package (Get-ChildItem ./dist/Soma-*-windows-x64.zip).FullName
+        run: ./tests/distribution.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-distribution-qa') -Package (Get-ChildItem ./dist/Soma-*-windows-x64.zip).FullName -Jdk $env:JAVA_HOME_21_X64
       - name: Checkout and readiness contracts
         shell: pwsh
         run: ./tests/targets.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-targets-qa') -Jdk $env:JAVA_HOME_21_X64
@@ -71,6 +74,7 @@ jobs:
           name: soma-native-verification
           path: |
             ${{ runner.temp }}/soma-ipc-qa/ipc-verification.json
+            ${{ runner.temp }}/soma-lifecycle-qa/lifecycle-verification.json
             ${{ runner.temp }}/soma-targets-qa/targets-verification.json
             ${{ runner.temp }}/soma-targets-qa/targets-failure.json
             ${{ runner.temp }}/soma-targets-qa/targets-failure.log

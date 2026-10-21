@@ -57,11 +57,10 @@ $settings=@{schema_version=1;projects=@(@{id='probe';name='Jobs fixture';directo
 $settings|ConvertTo-Json -Depth 15|Set-Content -LiteralPath (Join-Path $data 'projects.json')
 try{
     Assert ((Invoke-JobCli @('validate')).Value.ok) 'Separate runtime and test configurations validate'
-    $null=Invoke-JobCli @('show')
-    $owner=Get-CimInstance Win32_Process -Filter "Name='Soma.exe'"|Where-Object CommandLine -like "*$data*"|Select-Object -First 1
-    Assert ($null -ne $owner) 'Submitting jobs uses the existing native owner'
     $first=Submit 'sleep' 'test' @('--define=private.canary=soma-private-argument-fixture')
     Assert ($first.ok -and $first.job_id -and $first.participant_id) 'Submit returns a job and a participant'
+    $owner=Get-CimInstance Win32_Process -Filter "Name='Soma.exe'"|Where-Object CommandLine -like "*$data*"|Select-Object -First 1
+    Assert ($null -ne $owner -and (Get-Process -Id $owner.ProcessId).MainWindowHandle -eq 0) 'Maven submit starts a temporary owner without a window'
     Wait-Started $first.job_id
     $same=Submit 'sleep' 'test' @('--define=private.canary=soma-private-argument-fixture')
     Assert ($same.ok -and $same.deduplicated -and $same.job_id -eq $first.job_id -and $same.participant_id -ne $first.participant_id) 'Two agents share one active Maven execution with independent participation'
@@ -77,6 +76,12 @@ try{
     $timing=$done.Value.job.timings
     Assert (-not ($done.Value.job|ConvertTo-Json -Depth 12 -Compress).Contains('soma-private-argument-fixture')) 'Long-form Maven property values stay out of requested and effective JSON metadata'
     Assert ($null -ne $timing.resource_wait_ms -and $timing.maven_ms -gt 12000 -and $timing.total_ms -ge $timing.maven_ms) 'JSON separates measured preparation, queue, adapter waiting and Maven wall time'
+    $deadline=[DateTime]::UtcNow.AddSeconds(15)
+    do { $closed=(Invoke-JobCli @('status')).Value.status.state -eq 'closed';if($closed){break};Start-Sleep -Milliseconds 100 } while([DateTime]::UtcNow -lt $deadline)
+    Assert ($closed -and -not (Get-Process -Id $owner.ProcessId -ErrorAction SilentlyContinue)) 'Temporary Maven owner exits after the queue drains even while status is polled'
+    Assert ((Wait-Job $same.job_id).Code -eq 0) 'Maven wait retains its evidence after automatic owner exit'
+    $null=Invoke-JobCli @('show')
+    $owner=Get-CimInstance Win32_Process -Filter "Name='Soma.exe'"|Where-Object CommandLine -like "*$data*"|Select-Object -First 1
     $again=Submit 'pass';$againDone=Wait-Job $again.job_id
     Assert ($again.job_id -ne $same.job_id -and $againDone.Code -eq 0 -and @(Get-Content -LiteralPath (Join-Path $fixture 'invocations.txt')).Count -eq 2) 'A finished green result is not automatically reused'
     $failed=Submit 'fail';$failedDone=Wait-Job $failed.job_id

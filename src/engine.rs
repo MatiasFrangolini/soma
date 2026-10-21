@@ -24,13 +24,17 @@ use windows_sys::Win32::{
 
 const VISIBLE: usize = 2 * 1024 * 1024;
 const DISK: u64 = 10 * 1024 * 1024;
+#[cfg(test)]
+#[path = "observation_tests.rs"]
+mod observation_tests;
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
 }
-#[derive(Clone, Serialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Status {
     pub state: String,
     pub operation_id: Option<String>,
@@ -46,6 +50,7 @@ pub struct Status {
     pub branch: Option<String>,
     pub head: Option<String>,
     pub readiness: String,
+    pub readiness_checked_at_ms: Option<u64>,
 }
 impl Default for Status {
     fn default() -> Self {
@@ -64,6 +69,7 @@ impl Default for Status {
             branch: None,
             head: None,
             readiness: "not_configured".into(),
+            readiness_checked_at_ms: None,
         }
     }
 }
@@ -73,6 +79,34 @@ impl Status {
             self.state.as_str(),
             "checking" | "building" | "starting" | "running" | "stopping"
         )
+    }
+    pub fn completed(store: &Store, id: &str) -> Option<Self> {
+        if id.is_empty() || id.len() > 100 || !id.bytes().all(|b| b.is_ascii_digit() || b == b'-') {
+            return None;
+        }
+        let file = File::open(store.home.join("operations").join(format!("{id}.json"))).ok()?;
+        let mut bytes = Vec::new();
+        file.take(32769).read_to_end(&mut bytes).ok()?;
+        if bytes.len() > 32768 { return None; }
+        let status: Self = serde_json::from_slice(&bytes).ok()?;
+        (status.operation_id.as_deref() == Some(id)
+            && matches!(status.state.as_str(), "exited" | "failed" | "stopped"))
+            .then_some(status)
+    }
+    pub(crate) fn persist(&self, store: &Store) -> std::io::Result<()> {
+        let Some(id) = self.operation_id.as_deref() else { return Ok(()); };
+        let directory = store.home.join("operations");
+        fs::create_dir_all(&directory)?;
+        let temp = directory.join(format!("{id}.tmp"));
+        fs::write(&temp, serde_json::to_vec(self)?)?;
+        fs::rename(temp, directory.join(format!("{id}.json")))?;
+        let mut results = fs::read_dir(directory)?.flatten().map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "json")
+                && path.file_stem().is_some_and(|stem| stem.to_string_lossy().bytes().all(|b| b.is_ascii_digit() || b == b'-')))
+            .collect::<Vec<_>>();
+        results.sort();
+        for path in results.iter().take(results.len().saturating_sub(100)) { fs::remove_file(path)?; }
+        Ok(())
     }
 }
 pub struct LogBook {
@@ -84,6 +118,8 @@ pub struct LogBook {
     size: u64,
     visible_limit: usize,
     segment_limit: u64,
+    journal: crate::observation::Journal,
+    write_error: Option<String>,
 }
 impl LogBook {
     pub fn new(dir: PathBuf) -> Self {
@@ -94,11 +130,13 @@ impl LogBook {
             text: VecDeque::new(),
             bytes: 0,
             generation: 0,
-            dir,
+            dir: dir.clone(),
             file: None,
             size,
             visible_limit: VISIBLE,
             segment_limit: DISK,
+            journal: crate::observation::Journal::open(&dir),
+            write_error: None,
         };
         if let Ok(mut file) = File::open(book.dir.join("current.log")) {
             let _ = file.seek(SeekFrom::Start(size.saturating_sub((VISIBLE - 512) as u64)));
@@ -118,6 +156,8 @@ impl LogBook {
     fn write_disk(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
         while !bytes.is_empty() {
             if self.size >= self.segment_limit {
+                self.journal.rotating(&self.dir)?;
+                let discarded = fs::metadata(self.dir.join("previous-2.log")).map(|metadata| metadata.len()).unwrap_or(0);
                 self.file.take();
                 let _ = fs::remove_file(self.dir.join("previous-2.log"));
                 if self.dir.join("previous-1.log").exists() {
@@ -133,6 +173,7 @@ impl LogBook {
                     )?;
                 }
                 self.size = 0;
+                self.journal.rotated(&self.dir, discarded)?;
             }
             if self.file.is_none() {
                 self.file = Some(
@@ -151,6 +192,7 @@ impl LogBook {
     }
     pub fn append(&mut self, text: String) {
         if let Err(e) = self.write_disk(text.as_bytes()) {
+            self.write_error = Some(e.to_string());
             self.file.take();
             self.push(format!("\n[Soma] Error escribiendo logs: {e}\n"));
         }
@@ -171,6 +213,21 @@ impl LogBook {
     pub fn snapshot(&self) -> String {
         self.text.iter().map(String::as_str).collect()
     }
+    pub fn begin(&mut self, status: &Status) -> Result<()> {
+        self.journal.begin(&self.dir, status)
+    }
+    pub fn checkpoint(&mut self, status: &Status) {
+        if let Err(error) = self.journal.checkpoint(&self.dir, status) {
+            self.push(format!("\n[Soma] No se pudo guardar la observación: {error}\n"));
+        }
+    }
+    pub fn observe(&self, request: &Value, status: &Status) -> Value {
+        let mut result = crate::observation::logs(&self.dir, request, Some(status));
+        result["generation"] = self.generation.into();
+        result["visible_bytes"] = self.bytes.into();
+        result["write_error"] = json!(self.write_error);
+        result
+    }
     pub fn clear(&mut self) {
         self.text.clear();
         self.bytes = 0;
@@ -182,6 +239,18 @@ pub struct Engine {
     pub state: Mutex<Status>,
     pub logs: Arc<Mutex<LogBook>>,
     cancel: Mutex<Option<Arc<AtomicBool>>>,
+    health: Mutex<Option<HealthTarget>>,
+}
+struct HealthTarget {
+    spec: crate::readiness::Readiness,
+    job: isize,
+    operation_id: Option<String>,
+}
+struct HealthLease<'a>(&'a Mutex<Option<HealthTarget>>);
+impl Drop for HealthLease<'_> {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().take();
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Stamp {
@@ -214,6 +283,7 @@ impl Engine {
             store,
             state: Mutex::new(Status::default()),
             cancel: Mutex::new(None),
+            health: Mutex::new(None),
         })
     }
     pub(crate) fn finite(store: Store) -> Arc<Self> {
@@ -221,7 +291,7 @@ impl Engine {
         logs.visible_limit = 64 * 1024;
         logs.segment_limit = 1024 * 1024;
         Arc::new(Self { logs: Arc::new(Mutex::new(logs)), store,
-            state: Mutex::new(Status::default()), cancel: Mutex::new(None) })
+            state: Mutex::new(Status::default()), cancel: Mutex::new(None), health: Mutex::new(None) })
     }
     pub(crate) fn execute_finite(&self, command: CommandSpec, env: &BTreeMap<String, String>,
         cancel: &Arc<AtomicBool>) -> Result<u32> {
@@ -229,6 +299,32 @@ impl Engine {
     }
     pub fn status(&self) -> Status {
         self.state.lock().unwrap().clone()
+    }
+    pub fn observe_status(&self, request: &Value) -> Value {
+        let status = self.status();
+        if request["operation"].as_str().is_some_and(|expected| status.operation_id.as_deref() != Some(expected)) {
+            return json!({"ok":false,"code":"operation_replaced","error":"El ID no corresponde a la ejecución actual","status":status});
+        }
+        let mut health = json!({"state":"not_checked","checked_now":false});
+        if request["check_health"] == true {
+            let target = self.health.lock().unwrap();
+            health = match target.as_ref().filter(|target| target.operation_id == status.operation_id && status.state == "running") {
+                Some(target) => {
+                    let healthy = target.spec.target().is_ok_and(|endpoint| endpoint.probe(&target.spec, target.job as HANDLE));
+                    json!({"state":if healthy {"healthy"} else {"unhealthy"},"checked_now":true,
+                        "checked_at_ms":crate::observation::timestamp(),"operation_id":status.operation_id})
+                }
+                None => json!({"state":if status.state == "running" {"not_configured"} else {"not_running"},"checked_now":false}),
+            };
+            drop(target);
+            let current = self.status();
+            if current.operation_id != status.operation_id || current.state != status.state {
+                return json!({"ok":false,"code":"operation_replaced","error":"La ejecución cambió durante la observación","status":current});
+            }
+        }
+        json!({"ok":true,"status":status,"owner":{"state":"reachable"},"execution_state":status.state,
+            "observed_at_ms":crate::observation::timestamp(),"historical":false,"health":health,
+            "log_directory":self.store.home.join("logs"),"config_file":self.store.path()})
     }
     pub fn note(&self, text: impl AsRef<str>) {
         self.logs
@@ -305,6 +401,11 @@ impl Engine {
             directory: Some(p.directory.clone()),
             ..Default::default()
         };
+        if let Err(error) = self.logs.lock().unwrap().begin(&s) {
+            s.state = "failed".into();
+            s.error = Some(error.clone());
+            return crate::error(error);
+        }
         let cancel = Arc::new(AtomicBool::new(false));
         *self.cancel.lock().unwrap() = Some(cancel.clone());
         let own = self.clone();
@@ -338,7 +439,11 @@ impl Engine {
                 }
             }
             s.phase = "finalizado".into();
+            own.logs.lock().unwrap().checkpoint(&s);
             *own.cancel.lock().unwrap() = None;
+            if let Err(error) = s.persist(&own.store) {
+                own.note(format!("No se pudo guardar el resultado de ejecución: {error}"));
+            }
         });
         json!({"ok":true,"operation_id":id,"state":"checking"})
     }
@@ -360,6 +465,7 @@ impl Engine {
             let mut state = self.state.lock().unwrap();
             state.branch = Some(branch);
             state.head = head;
+            self.logs.lock().unwrap().checkpoint(&state);
         }
         let env = model::environment(p, c)?;
         use sha2::{Digest, Sha256};
@@ -527,6 +633,13 @@ impl Engine {
             .unwrap()
             .join("soma-cli.exe");
         let mut worker = NativeWorker::spawn(&exe)?;
+        let _health_lease = HealthLease(&self.health);
+        if let Some(spec) = readiness {
+            let operation_id = self.status().operation_id;
+            *self.health.lock().unwrap() = Some(HealthTarget {
+                spec: spec.clone(), job: worker.job.0, operation_id,
+            });
+        }
         let launch = Launch {
             command,
             environment: env.clone(),
@@ -618,11 +731,19 @@ impl Engine {
                     .unwrap()
                     .probe(spec, worker.job.0 as HANDLE)
                 {
-                    self.state.lock().unwrap().readiness = "ready".into();
+                    let mut state = self.state.lock().unwrap();
+                    state.readiness = "ready".into();
+                    state.readiness_checked_at_ms = Some(crate::observation::timestamp());
+                    self.logs.lock().unwrap().checkpoint(&state);
+                    drop(state);
                     self.note("Aplicación lista: readiness confirmado en un proceso propio");
                     checking_ready = false;
                 } else if startup_at.elapsed() >= Duration::from_secs(spec.timeout_seconds) {
-                    self.state.lock().unwrap().readiness = "timed_out".into();
+                    let mut state = self.state.lock().unwrap();
+                    state.readiness = "timed_out".into();
+                    state.readiness_checked_at_ms = Some(crate::observation::timestamp());
+                    self.logs.lock().unwrap().checkpoint(&state);
+                    drop(state);
                     self.note(
                         "Readiness agotó su plazo; el proceso sigue activo. Consultá sus logs",
                     );

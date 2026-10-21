@@ -9,10 +9,28 @@ pub fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("help");
     if matches!(cmd, "help" | "--help" | "-h") {
-        println!("Soma {} — agente y ventana comparten una ejecución\n\n  projects [--json]\n  add --path DIRECTORIO\n  configs --project ID\n  validate\n  config-path\n  status\n  worktrees --path DIRECTORIO\n  branches --path DIRECTORIO\n  switch --path DIRECTORIO --branch RAMA\n  run --path DIRECTORIO [--config ID] [--reuse] [--wait-ready] [--health-url URL]\n  build --project ID [--config ID] [--wait]\n  wait --operation ID [--ready] [--timeout 600]\n  restart [--project ID] [--config ID]\n  stop [--operation ID]\n  logs [--tail 200]\n  jobs submit --path DIRECTORIO --config tests --kind test|build [--wait] -- ARGUMENTOS_MAVEN\n  jobs configs --path DIRECTORIO\n  jobs list\n  jobs status|wait|logs --job ID\n  jobs release --job ID --participant ID\n  show\n  close\n\nTodas las respuestas de operación son JSON. --data-dir PATH / SOMA_HOME cambia el almacenamiento.\nRun admite --project ID o --path y compila antes de iniciar. --reuse exige un build vigente.\n--wait espera la salida; --wait-ready espera la API. Stop con --operation rechaza un ID ajeno. El cierre de la ventana detiene sus procesos.", env!("CARGO_PKG_VERSION"));
+        println!("Soma {} — agente y ventana comparten una ejecución\n\n  projects [--json]\n  add --path DIRECTORIO\n  configs --project ID\n  presets\n  apply-preset --project ID [--preset jvm-optimized] [--from-config ID]\n  validate\n  config-path\n  status [--operation ID] [--health]\n  worktrees --path DIRECTORIO\n  branches --path DIRECTORIO\n  switch --path DIRECTORIO --branch RAMA\n  run --path DIRECTORIO [--config ID] [--reuse] [--wait-ready] [--health-url URL]\n  build --project ID [--config ID] [--wait]\n  wait --operation ID [--ready] [--timeout 600]\n  restart [--project ID] [--config ID]\n  stop [--operation ID]\n  logs [--operation ID] [--tail 200 | --after CURSOR] [--contains TEXTO]\n  jobs submit --path DIRECTORIO --config tests --kind test|build [--wait] -- ARGUMENTOS_MAVEN\n  jobs configs --path DIRECTORIO\n  jobs list\n  jobs status|wait|logs --job ID\n  jobs release --job ID --participant ID\n  show\n  close\n\nTodas las respuestas de operación son JSON. --data-dir PATH / SOMA_HOME cambia el almacenamiento.\nRun admite --project ID o --path y compila antes de iniciar. --reuse exige un build vigente.\n--wait espera la salida; --wait-ready espera la API. Stop con --operation rechaza un ID ajeno. El cierre de la ventana detiene sus procesos.", env!("CARGO_PKG_VERSION"));
         return 0;
     }
     let store = Store::from_args();
+    if cmd == "status" && args.iter().any(|argument| argument == "--operation")
+        && flag(&args, "--operation").is_none_or(|value| value.starts_with("--")) {
+        return print(crate::error("Falta el valor de --operation"));
+    }
+    if cmd == "logs" {
+        for name in ["--operation", "--after", "--contains", "--tail"] {
+            if args.iter().any(|argument| argument == name)
+                && flag(&args, name).is_none_or(|value| value.starts_with("--")) {
+                return print(crate::error(format!("Falta el valor de {name}")));
+            }
+        }
+        if flag(&args, "--tail").is_some_and(|value| value.parse::<u64>().is_err()) {
+            return print(crate::error("--tail requiere un entero no negativo"));
+        }
+        if flag(&args, "--after").is_some() && flag(&args, "--tail").is_some() {
+            return print(crate::error("--after consume datos nuevos; no se combina con --tail"));
+        }
+    }
     if let Err(e) = store.initialize() {
         return print(crate::error(e));
     }
@@ -63,6 +81,12 @@ pub fn run() -> i32 {
         );
     }
     let result=match cmd {
+        "presets"=>crate::model::JavaPreset::optimized().map(|preset|json!({"ok":true,"presets":[preset]})),
+        "apply-preset"=>{
+            let preset=flag(&args,"--preset").unwrap_or_else(||"jvm-optimized".into());
+            store.apply_preset(project.as_deref().unwrap_or_default(),&preset,flag(&args,"--from-config").as_deref())
+                .map(|added|json!({"ok":true,"project":project,"config":preset,"added":added,"config_file":store.path()}))
+        },
         "projects"=>store.load().map(|s|json!({"ok":true,"projects":s.projects.iter().map(|p|json!({"id":p.id,"name":p.name,"directory":p.directory,"configs":p.configs.iter().map(|c|json!({"id":c.id,"name":c.name})).collect::<Vec<_>>()})).collect::<Vec<_>>()})),
         "configs"=>store.find(project.as_deref().unwrap_or_default(),flag(&args,"--config").as_deref()).and_then(|(p,_)|store.load().map(|s|json!({"ok":true,"project":p.id,"configs":s.projects.iter().find(|x|x.id==p.id).unwrap().configs.iter().map(|c|json!({"id":c.id,"name":c.name,"env_file":c.env_file,"override_names":c.env.keys().collect::<Vec<_>>(),"profiles":c.profiles,"jdk":c.jdk,"config_files":c.config_files})).collect::<Vec<_>>()}))),
         "add"=>store.add_directory(std::path::Path::new(&flag(&args,"--path").unwrap_or_default())).map(|id|json!({"ok":true,"project":id,"config_file":store.path()})),
@@ -74,15 +98,25 @@ pub fn run() -> i32 {
             let readiness=flag(&args,"--health-url").map(|url|crate::readiness::Readiness{url,timeout_seconds:timeout,json_field:Some("status".into()),expected:"UP".into()});
             let request=json!({"command":command,"mode":mode,"project":project,"config":flag(&args,"--config"),"directory":path,
                 "operation":flag(&args,"--operation"),"branch":flag(&args,"--branch"),"readiness":readiness,
+                "after":flag(&args,"--after"),"contains":flag(&args,"--contains"),"check_health":args.iter().any(|argument| argument == "--health"),
                 "tail":flag(&args,"--tail").and_then(|s|s.parse::<u64>().ok())});
             match ipc::request(&store,&request) {
+                Ok(v) if v["code"]=="owner_closing" && matches!(cmd,"run"|"build"|"restart"|"show"|"switch")=>Ok(ipc::request_or_launch(&store,&request).unwrap_or_else(|e|e.response())),
                 Ok(v)=>Ok(v),
                 Err(e) if !e.is_absent()=>Ok(e.response()),
                 Err(_) if matches!(cmd,"run"|"build"|"restart"|"show"|"switch")=>{
                     Ok(ipc::request_or_launch(&store,&request).unwrap_or_else(|e|e.response()))
-                },Err(_) if cmd=="status"=>Ok(json!({"ok":true,"status":{"state":"closed"},"config_file":store.path(),"log_directory":store.home.join("logs")})),
+                },Err(error) if cmd=="status"=>{
+                    let mut value=crate::observation::offline_status(&store.home.join("logs"),"absent",&error.to_string());
+                    value["config_file"]=json!(store.path());
+                    if request["check_health"]==true || request["operation"].is_string() {
+                        value["ok"]=json!(false);value["code"]=json!("owner_unavailable");
+                        value["error"]=json!("No se puede verificar la ejecución sin comunicación con su instancia Soma");
+                    }
+                    Ok(value)
+                },
                 Err(_) if matches!(cmd,"stop"|"close")=>Ok(json!({"ok":true,"state":"closed"})),
-                Err(_) if cmd=="logs"=>offline_logs(&store,flag(&args,"--tail").and_then(|v|v.parse().ok()).unwrap_or(200)),
+                Err(_) if cmd=="logs"=>Ok(crate::observation::logs(&store.home.join("logs"),&request,None)),
                 Err(e)=>Err(format!("La ventana está cerrada: {e}")),
             }
         },
@@ -108,23 +142,35 @@ pub fn run() -> i32 {
 fn wait_for(store: &Store, id: &str, timeout: u64, ready: bool) -> Value {
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout);
     loop {
+        let mut historical = false;
         let response = match ipc::request(store, &json!({"command":"status"})) {
-            Ok(v) => v,
+            Ok(v) => {
+                if v["status"]["operation_id"].as_str() != Some(id) {
+                    if let Some(status) = crate::engine::Status::completed(store, id) {
+                        historical = true;
+                        json!({"ok":true,"status":status})
+                    } else { v }
+                } else { v }
+            },
             Err(e) if !e.is_absent() => return e.response(),
             Err(_) => {
-                return json!({"ok":false,"code":"stopped","error":"La ventana se cerró","operation_id":id})
+                match crate::engine::Status::completed(store, id) {
+                    Some(status) => { historical = true; json!({"ok":true,"status":status}) },
+                    None => return json!({"ok":false,"code":"stopped","error":"Soma se cerró sin un resultado final disponible","operation_id":id}),
+                }
             }
         };
         let state = &response["status"];
+        let source = if historical { "disk" } else { "live" };
         if state["operation_id"].as_str() != Some(id) {
             return json!({"ok":false,"code":"operation_replaced","error":"Otra operación reemplazó el estado consultado","status":state});
         }
         match state["state"].as_str().unwrap_or("") {
             "exited" => {
                 return if ready {
-                    json!({"ok":false,"code":"process_failed","error":"El proceso terminó antes de confirmar readiness","status":state})
+                    json!({"ok":false,"code":"process_failed","error":"El proceso terminó antes de confirmar readiness","status":state,"source":source})
                 } else {
-                    json!({"ok":true,"status":state})
+                    json!({"ok":true,"status":state,"source":source})
                 }
             }
             "failed" => {
@@ -136,9 +182,9 @@ fn wait_for(store: &Store, id: &str, timeout: u64, ready: bool) -> Value {
                 } else {
                     "process_failed"
                 };
-                return json!({"ok":false,"code":code,"status":state});
+                return json!({"ok":false,"code":code,"status":state,"source":source});
             }
-            "stopped" => return json!({"ok":false,"code":"stopped","status":state}),
+            "stopped" => return json!({"ok":false,"code":"stopped","status":state,"source":source}),
             _ => {}
         }
         if ready && state["state"] == "running" {
@@ -179,28 +225,4 @@ fn print(result: Value) -> i32 {
             _ => 2,
         }
     }
-}
-fn offline_logs(store: &Store, tail: usize) -> std::result::Result<Value, String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut bytes = Vec::new();
-    for name in ["previous-2.log", "previous-1.log", "current.log"] {
-        let path = store.home.join("logs").join(name);
-        if !path.is_file() {
-            continue;
-        }
-        let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
-        let length = file.metadata().map_err(|e| e.to_string())?.len();
-        file.seek(SeekFrom::Start(length.saturating_sub(2 * 1024 * 1024)))
-            .map_err(|e| e.to_string())?;
-        file.read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-        if bytes.len() > 2 * 1024 * 1024 {
-            bytes.drain(..bytes.len() - 2 * 1024 * 1024);
-        }
-    }
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines = text.lines().rev().take(tail.min(20000)).collect::<Vec<_>>();
-    lines.reverse();
-    Ok(
-        json!({"ok":true,"text":lines.join("\n"),"source":"disk","directory":store.home.join("logs")}),
-    )
 }

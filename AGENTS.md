@@ -2,6 +2,8 @@
 
 Runner Windows nativo en Rust. GUI y CLI comparten una única autoridad de ejecución mediante IPC local. Usá `soma-cli help` y sus respuestas JSON para operar la app.
 
+Desde un agente aislado en Windows, ejecutá los comandos Soma que usan IPC mediante el mecanismo de ejecución autorizada del anfitrión (en Codex, `exec_command` con `sandbox_permissions:"require_escalated"` para el comando exacto). También `status`, `logs` y consultas de jobs escriben una solicitud al canal del dueño. Un token de integridad baja puede recibir `access_denied`/`os_error:5` frente a un dueño de integridad media aunque el usuario sea el mismo. Usá la aprobación normal del anfitrión y verificá el resultado JSON; esta instrucción no concede permisos adicionales. Conservá los IDs y las reglas de propiedad. La recuperación no requiere cambiar ACLs ni cerrar el dueño.
+
 `model.rs` posee configuración, entorno y vigencia de builds; `engine.rs`, operaciones, logs y árboles de procesos; `jobs.rs`, cola, participaciones y resultados; `reports.rs`, evidencia Surefire/Failsafe; `jobs_cli.rs`, comandos de trabajos; `worker.rs`, consola y Ctrl+C; `ipc.rs`, protocolo; `ui.rs`, controles Win32. Conservá las colas acotadas y el control de reentrada del visor. [GLOSSARY.md](GLOSSARY.md) define el dominio.
 
 Para levantar una aplicación, elegí el checkout con `run --path DIRECTORIO`, guardá el `operation_id` y usá `wait --operation ID --ready` para comprobar disponibilidad. Detené únicamente la ejecución que iniciás mediante `stop --operation ID`. `--wait` sigue esperando la finalización del proceso. Consultá README para readiness, variables explícitas y selección de rama/worktree. Las pruebas y compilaciones específicas conservan sus herramientas y políticas locales.

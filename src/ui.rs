@@ -897,28 +897,27 @@ pub fn run() {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
         CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32);
         let store = Store::from_args();
-        if let Err(e) = store.initialize() {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                wide(&e).as_ptr(),
-                wide("Soma").as_ptr(),
-                MB_ICONERROR,
-            );
-            return;
-        }
+        // Check ownership before touching history or configuration. A restricted caller
+        // may see the data directory but cannot open an existing owner's mutex.
         let mutex_name = wide(&format!("Local\\{}", ipc::name(&store).replace('\\', "-")));
         let mutex = CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr());
+        if mutex.is_null() {
+            return;
+        }
         if GetLastError() == ERROR_ALREADY_EXISTS {
             let _ = ipc::request(&store, &serde_json::json!({"command":"show"}));
-            if !mutex.is_null() {
-                CloseHandle(mutex);
-            }
+            CloseHandle(mutex);
+            return;
+        }
+        if let Err(e) = store.initialize() {
+            startup_error(&e);
+            CloseHandle(mutex);
             return;
         }
         let jobs = match crate::jobs::Jobs::new(store.clone()) {
             Ok(jobs) => jobs,
             Err(error) => {
-                MessageBoxW(std::ptr::null_mut(), wide(&error).as_ptr(), wide("Soma").as_ptr(), MB_ICONERROR);
+                startup_error(&error);
                 CloseHandle(mutex);
                 return;
             }
@@ -951,12 +950,7 @@ pub fn run() {
             ptr as _,
         );
         if h.is_null() {
-            MessageBoxW(
-                std::ptr::null_mut(),
-                wide(&std::io::Error::last_os_error().to_string()).as_ptr(),
-                wide("Soma").as_ptr(),
-                MB_ICONERROR,
-            );
+            startup_error(&std::io::Error::last_os_error().to_string());
             drop(Box::from_raw(ptr));
             CloseHandle(mutex);
             return;
@@ -980,5 +974,12 @@ pub fn run() {
             CloseHandle(mutex);
         }
         CoUninitialize();
+    }
+}
+
+unsafe fn startup_error(error: &str) {
+    // CLI callers receive a JSON connection error; never leave them waiting on a modal dialog.
+    if !std::env::args().any(|arg| arg == "--cli-owner") {
+        MessageBoxW(std::ptr::null_mut(), wide(error).as_ptr(), wide("Soma").as_ptr(), MB_ICONERROR);
     }
 }

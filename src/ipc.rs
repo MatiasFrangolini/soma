@@ -23,11 +23,47 @@ use windows_sys::Win32::{
 pub static WINDOW: AtomicIsize = AtomicIsize::new(0);
 pub const SHOW: u32 = WM_APP + 5;
 pub const CLOSE: u32 = WM_APP + 6;
+#[derive(Debug)]
+pub struct RequestError {
+    error: std::io::Error,
+    absent: bool,
+}
+impl RequestError {
+    pub fn is_absent(&self) -> bool {
+        self.absent
+    }
+    pub fn response(&self) -> Value {
+        let code = if self.error.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) {
+            "access_denied"
+        } else if self.absent {
+            "owner_unavailable"
+        } else {
+            "ipc_unavailable"
+        };
+        let mut response = json!({"ok":false,"code":code,"error":format!("No se pudo comunicar con Soma: {}", self.error),
+            "os_error":self.error.raw_os_error()});
+        if code == "access_denied" {
+            response["next_action"] = json!("request_authorized_execution");
+            response["hint"] = json!("Si el comando corre en un sandbox, solicitá al anfitrión la ejecución autorizada de ese comando exacto. El canal requiere escribir la solicitud incluso para status/logs. Conservá el dueño y sus ejecuciones; no cambies los permisos del canal.");
+        }
+        response
+    }
+}
+impl From<std::io::Error> for RequestError {
+    fn from(error: std::io::Error) -> Self {
+        Self { error, absent: false }
+    }
+}
+impl std::fmt::Display for RequestError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(f)
+    }
+}
 pub fn name(store: &Store) -> String {
     let h = Sha256::digest(store.home.to_string_lossy().to_ascii_lowercase().as_bytes());
     format!("\\\\.\\pipe\\Soma-{:x}", h)[..41].to_string()
 }
-pub fn request(store: &Store, request: &Value) -> std::result::Result<Value, String> {
+pub fn request(store: &Store, request: &Value) -> Result<Value, RequestError> {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut pipe = loop {
         match OpenOptions::new().read(true).write(true).open(name(store)) {
@@ -35,17 +71,38 @@ pub fn request(store: &Store, request: &Value) -> std::result::Result<Value, Str
             Err(e) if e.raw_os_error() == Some(231) && std::time::Instant::now() < until => unsafe {
                 WaitNamedPipeW(crate::wide(&name(store)).as_ptr(), 250);
             },
-            Err(e) => return Err(e.to_string()),
+            Err(error) => return Err(RequestError {
+                absent: matches!(error.raw_os_error(), Some(2 | 3)),
+                error,
+            }),
         }
     };
-    writeln!(pipe, "{request}").map_err(|e| e.to_string())?;
-    pipe.flush().map_err(|e| e.to_string())?;
+    writeln!(pipe, "{request}")?;
+    pipe.flush()?;
     let mut result = String::new();
     BufReader::new(pipe)
         .take(16 * 1024 * 1024)
-        .read_line(&mut result)
-        .map_err(|e| e.to_string())?;
-    serde_json::from_str(&result).map_err(|e| e.to_string())
+        .read_line(&mut result)?;
+    serde_json::from_str(&result)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e).into())
+}
+pub fn request_or_launch(store: &Store, request: &Value) -> Result<Value, RequestError> {
+    match self::request(store, request) {
+        Ok(value) => return Ok(value),
+        Err(error) if error.is_absent() => {},
+        Err(error) => return Err(error),
+    }
+    let exe = std::env::current_exe()?.with_file_name("Soma.exe");
+    crate::launch_windowed(&exe, &format!("--cli-owner --data-dir \"{}\"", store.home.display()))?;
+    for _ in 0..100 {
+        std::thread::sleep(std::time::Duration::from_millis(75));
+        match self::request(store, request) {
+            Ok(value) => return Ok(value),
+            Err(error) if error.is_absent() => {},
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Soma no pudo abrir su canal local").into())
 }
 pub fn serve(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>) {
     std::thread::spawn(move || unsafe {

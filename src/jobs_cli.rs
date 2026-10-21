@@ -7,31 +7,16 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .find(|a| a[0] == name && !a[1].starts_with("--"))
         .map(|a| a[1].clone())
 }
-fn call(store: &Store, request: &Value, open: bool) -> Result<Value, String> {
-    if let Ok(value) = ipc::request(store, request) {
-        return Ok(value);
+fn call(store: &Store, request: &Value, open: bool) -> Result<Value, ipc::RequestError> {
+    if open {
+        ipc::request_or_launch(store, request)
+    } else {
+        ipc::request(store, request)
     }
-    if !open {
-        return Err("El dueño de Soma no está disponible".into());
-    }
-    let exe = std::env::current_exe()
-        .map_err(|e| e.to_string())?
-        .parent()
-        .ok_or("Directorio de Soma inválido")?
-        .join("Soma.exe");
-    crate::launch_windowed(&exe, &format!("--data-dir \"{}\"", store.home.display()))
-        .map_err(|e| e.to_string())?;
-    for _ in 0..100 {
-        std::thread::sleep(Duration::from_millis(75));
-        if let Ok(value) = ipc::request(store, request) {
-            return Ok(value);
-        }
-    }
-    Err("Soma no pudo abrir su canal local".into())
 }
 fn status(store: &Store, id: &str) -> Value {
     call(store, &json!({"command":"job_status","job":id}), false)
-        .unwrap_or_else(|_| Jobs::offline(store, id, None))
+        .unwrap_or_else(|e| if e.is_absent() { Jobs::offline(store, id, None) } else { e.response() })
 }
 fn outcome(response: Value) -> Value {
     if response["ok"] != true {
@@ -97,7 +82,7 @@ pub fn run(store: &Store, args: &[String]) -> Value {
             let request = json!({"command":"job_submit","request":{
                 "directory":directory,"config":flag(options,"--config").unwrap_or_else(||"tests".into()),
                 "kind":flag(options,"--kind").unwrap_or_else(||"test".into()),"args":maven_args}});
-            let submitted = match call(store, &request, true) { Ok(value)=>value, Err(e)=>return crate::error(e) };
+            let submitted = match call(store, &request, true) { Ok(value)=>value, Err(e)=>return e.response() };
             if submitted["ok"] != true { return submitted; }
             let Some(requested) = submitted["job_id"].as_str() else { return crate::error("Falta identidad de trabajo"); };
             let deadline = Instant::now() + Duration::from_secs(timeout);
@@ -128,11 +113,11 @@ pub fn run(store: &Store, args: &[String]) -> Value {
         "logs" if !id.is_empty() => {
             let tail = flag(options,"--tail").and_then(|s|s.parse::<usize>().ok()).unwrap_or(200).min(2000);
             call(store, &json!({"command":"job_logs","job":id,"tail":tail}), false)
-                .unwrap_or_else(|_|Jobs::offline(store,&id,Some(tail)))
+                .unwrap_or_else(|e| if e.is_absent() { Jobs::offline(store,&id,Some(tail)) } else { e.response() })
         }
         "release" if !id.is_empty() => {
             let Some(participant) = flag(options,"--participant") else { return crate::error("Falta --participant; cancelar requiere tu propia participación"); };
-            call(store,&json!({"command":"job_release","job":id,"participant":participant}),false).unwrap_or_else(crate::error)
+            call(store,&json!({"command":"job_release","job":id,"participant":participant}),false).unwrap_or_else(|e|e.response())
         }
         "configs" => {
             let Some(path) = flag(options,"--path") else { return crate::error("Falta --path"); };
@@ -147,7 +132,7 @@ pub fn run(store: &Store, args: &[String]) -> Value {
                 Err(error) => crate::error(error),
             }
         }
-        "list" => call(store,&json!({"command":"job_list"}),false).unwrap_or_else(|_|Jobs::offline_list(store)),
+        "list" => call(store,&json!({"command":"job_list"}),false).unwrap_or_else(|e| if e.is_absent() { Jobs::offline_list(store) } else { e.response() }),
         _ => crate::error("Usá jobs submit/configs/list/status/wait/logs/release; status/wait/logs/release requieren --job ID"),
     }
 }

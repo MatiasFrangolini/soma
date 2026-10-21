@@ -76,12 +76,10 @@ pub fn run() -> i32 {
                 "operation":flag(&args,"--operation"),"branch":flag(&args,"--branch"),"readiness":readiness,
                 "tail":flag(&args,"--tail").and_then(|s|s.parse::<u64>().ok())});
             match ipc::request(&store,&request) {
-                Ok(v)=>Ok(v),Err(_) if matches!(cmd,"run"|"build"|"restart"|"show"|"switch")=>{
-                    let exe=std::env::current_exe().unwrap().parent().unwrap().join("Soma.exe");
-                    match crate::launch_windowed(&exe,&format!("--data-dir \"{}\"",store.home.display())){
-                        Ok(_)=>{let mut result=Err("La ventana no pudo abrir el canal local".into());for _ in 0..100 {std::thread::sleep(Duration::from_millis(75));if let Ok(value)=ipc::request(&store,&request){result=Ok(value);break;}}result},
-                        Err(e)=>Err(e.to_string()),
-                    }
+                Ok(v)=>Ok(v),
+                Err(e) if !e.is_absent()=>Ok(e.response()),
+                Err(_) if matches!(cmd,"run"|"build"|"restart"|"show"|"switch")=>{
+                    Ok(ipc::request_or_launch(&store,&request).unwrap_or_else(|e|e.response()))
                 },Err(_) if cmd=="status"=>Ok(json!({"ok":true,"status":{"state":"closed"},"config_file":store.path(),"log_directory":store.home.join("logs")})),
                 Err(_) if matches!(cmd,"stop"|"close")=>Ok(json!({"ok":true,"state":"closed"})),
                 Err(_) if cmd=="logs"=>offline_logs(&store,flag(&args,"--tail").and_then(|v|v.parse().ok()).unwrap_or(200)),
@@ -112,6 +110,7 @@ fn wait_for(store: &Store, id: &str, timeout: u64, ready: bool) -> Value {
     loop {
         let response = match ipc::request(store, &json!({"command":"status"})) {
             Ok(v) => v,
+            Err(e) if !e.is_absent() => return e.response(),
             Err(_) => {
                 return json!({"ok":false,"code":"stopped","error":"La ventana se cerró","operation_id":id})
             }

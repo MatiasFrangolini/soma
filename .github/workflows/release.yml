@@ -49,6 +49,9 @@ jobs:
           $version = [regex]::Match((Get-Content Cargo.toml -Raw), '(?m)^version = "([0-9.]+)"').Groups[1].Value
           if ($env:SOURCE_REF.StartsWith('refs/tags/') -and $env:SOURCE_REF -ne "refs/tags/v$version") { throw 'Tag and Cargo version differ' }
           ./scripts/Package.ps1 -BinaryDirectory ./target/x86_64-pc-windows-gnu/release -RepositoryUrl $env:REPOSITORY_URL
+      - name: IPC permission contracts
+        shell: pwsh
+        run: ./tests/ipc.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-ipc-qa')
       - name: Process contracts
         shell: pwsh
         run: ./tests/verify.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-process-qa') -Jdk $env:JAVA_HOME_21_X64
@@ -67,6 +70,7 @@ jobs:
         with:
           name: soma-native-verification
           path: |
+            ${{ runner.temp }}/soma-ipc-qa/ipc-verification.json
             ${{ runner.temp }}/soma-targets-qa/targets-verification.json
             ${{ runner.temp }}/soma-targets-qa/targets-failure.json
             ${{ runner.temp }}/soma-targets-qa/targets-failure.log

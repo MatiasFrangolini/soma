@@ -12,6 +12,8 @@ concurrency:
   cancel-in-progress: false
 jobs:
   build:
+    # A release-only main push is validated once by its exact tag workflow.
+    if: github.event_name != 'push' || github.ref != 'refs/heads/main' || !contains(github.event.head_commit.message, '[release-only]')
     runs-on: windows-2025
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5

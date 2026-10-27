@@ -28,3 +28,4 @@ foreach($check in $checks){
     if(Test-Path -LiteralPath $data){throw 'Argument handling unexpectedly initialized the data store'}
 }
 Write-Output 'PASS: help and invalid Soma arguments cause no data or owner side effects'
+exit 0

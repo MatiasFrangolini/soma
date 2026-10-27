@@ -161,6 +161,7 @@ struct State {
     entries: BTreeMap<String, Entry>,
     preparing: VecDeque<String>,
     ready: VecDeque<String>,
+    active_checkouts: BTreeSet<PathBuf>,
     closing: bool,
 }
 pub struct Jobs {
@@ -168,7 +169,7 @@ pub struct Jobs {
     state: Mutex<State>,
     changed: Condvar,
     preparing: AtomicBool,
-    executing: AtomicBool,
+    concurrency: usize,
 }
 fn safe_args(args: &[String]) -> Vec<String> {
     let mut property = false;
@@ -394,11 +395,13 @@ fn plan(store: &Store, request: &Request) -> Result<Plan> {
 }
 impl Jobs {
     pub fn new(store: Store) -> Result<Arc<Self>> {
+        let concurrency = store.load()?.job_concurrency;
         fs::create_dir_all(store.home.join("jobs")).map_err(|e| e.to_string())?;
         let mut state = State {
             entries: BTreeMap::new(),
             preparing: VecDeque::new(),
             ready: VecDeque::new(),
+            active_checkouts: BTreeSet::new(),
             closing: false,
         };
         for directory in fs::read_dir(store.home.join("jobs"))
@@ -445,7 +448,7 @@ impl Jobs {
             state: Mutex::new(state),
             changed: Condvar::new(),
             preparing: AtomicBool::new(false),
-            executing: AtomicBool::new(false),
+            concurrency,
         });
         {
             let mut state = jobs.state.lock().unwrap();
@@ -456,8 +459,10 @@ impl Jobs {
         }
         let own = jobs.clone();
         std::thread::spawn(move || own.prepare_loop());
-        let own = jobs.clone();
-        std::thread::spawn(move || own.execute_loop());
+        for _ in 0..concurrency {
+            let own = jobs.clone();
+            std::thread::spawn(move || own.execute_loop());
+        }
         Ok(jobs)
     }
     fn directory(&self, id: &str) -> PathBuf {
@@ -581,7 +586,14 @@ impl Jobs {
         let Some(entry) = state.entries.get(&canonical) else {
             return crate::error("El trabajo compartido venció");
         };
-        json!({"ok":true,"job_id":canonical,"requested_job_id":id,"job":entry.record,
+        let wait_reason = match entry.record.state.as_str() {
+            "queued" if state.active_checkouts.contains(&entry.record.directory) => Some("checkout_in_use"),
+            "queued" => Some("soma_queue"),
+            "waiting_checkout" => Some("checkout_in_use"),
+            "waiting_resources" => Some("resource_admission"),
+            _ => None,
+        };
+        json!({"ok":true,"job_id":canonical,"requested_job_id":id,"job":entry.record,"wait_reason":wait_reason,
             "participants":entry.participants.len(),"worker_pid":entry.runner.as_ref().and_then(|r|r.status().worker_pid)})
     }
     pub fn list(&self) -> Value {
@@ -596,7 +608,7 @@ impl Jobs {
                 "created_at_ms":e.record.created_at_ms,"participants":e.participants.len()})
             })
             .collect::<Vec<_>>();
-        json!({"ok":true,"jobs":records,"concurrency":1,"retained_limit":HISTORY,"log_budget_bytes":LOG_BUDGET})
+        json!({"ok":true,"jobs":records,"concurrency":self.concurrency,"retained_limit":HISTORY,"log_budget_bytes":LOG_BUDGET})
     }
     pub fn release(&self, id: &str, participant: &str) -> Value {
         let mut state = self.state.lock().unwrap();
@@ -652,8 +664,9 @@ impl Jobs {
         self.changed.notify_all();
     }
     pub fn busy(&self) -> bool {
-        self.preparing.load(Ordering::SeqCst) || self.executing.load(Ordering::SeqCst)
-            || self.state.lock().unwrap().entries.values().any(|entry| !terminal(&entry.record.state))
+        let state = self.state.lock().unwrap();
+        self.preparing.load(Ordering::SeqCst) || !state.active_checkouts.is_empty()
+            || state.entries.values().any(|entry| !terminal(&entry.record.state))
     }
     fn prepare_loop(self: Arc<Self>) {
         loop {
@@ -768,24 +781,26 @@ impl Jobs {
         loop {
             let (id, plan, request, cancel) = {
                 let mut state = self.state.lock().unwrap();
-                while state.ready.is_empty() && !state.closing {
-                    state = self.changed.wait(state).unwrap();
+                loop {
+                    if state.closing { return; }
+                    let position = state.ready.iter().position(|id| match state.entries.get(id) {
+                        None => true,
+                        Some(entry) if terminal(&entry.record.state) => true,
+                        Some(entry) => entry.plan.as_ref().is_none_or(|plan|
+                            !state.active_checkouts.contains(&plan.project.directory)),
+                    });
+                    let Some(position) = position else {
+                        state = self.changed.wait(state).unwrap();
+                        continue;
+                    };
+                    let id = state.ready.remove(position).unwrap();
+                    let Some(entry) = state.entries.get_mut(&id) else { continue };
+                    if terminal(&entry.record.state) { continue; }
+                    let (Some(plan), Some(request)) = (entry.plan.take(), entry.request.clone()) else { continue };
+                    let cancel = entry.cancel.clone();
+                    state.active_checkouts.insert(plan.project.directory.clone());
+                    break (id, plan, request, cancel);
                 }
-                if state.closing {
-                    return;
-                }
-                let id = state.ready.pop_front().unwrap();
-                let Some(entry) = state.entries.get_mut(&id) else {
-                    continue;
-                };
-                if terminal(&entry.record.state) {
-                    continue;
-                }
-                let (Some(plan), Some(request)) = (entry.plan.take(), entry.request.clone()) else {
-                    continue;
-                };
-                self.executing.store(true, Ordering::SeqCst);
-                (id, plan, request, entry.cancel.clone())
             };
             let result = self.execute(&id, &plan, &request, &cancel);
             match result {
@@ -827,7 +842,9 @@ impl Jobs {
                     self.finish(&id, state, Some(error));
                 }
             }
-            self.executing.store(false, Ordering::SeqCst);
+            let mut state = self.state.lock().unwrap();
+            state.active_checkouts.remove(&plan.project.directory);
+            self.changed.notify_all();
         }
     }
     fn execute(
@@ -911,7 +928,7 @@ impl Jobs {
         });
         {
             let mut state = self.state.lock().unwrap();
-            self.prune(&mut state, LOG_BUDGET - ACTIVE_LOG_BUDGET);
+            self.prune(&mut state, LOG_BUDGET - ACTIVE_LOG_BUDGET * self.concurrency as u64);
             self.update(&mut state, id, |entry| {
                 entry.record.state = "waiting_resources".into();
                 entry.record.timings.soma_queue_ms = prepared.map(ms);
@@ -1114,7 +1131,8 @@ impl Jobs {
                 }
             }
         }
-        json!({"ok":true,"jobs":records,"owner_unavailable":true,"concurrency":1,
+        let concurrency = store.load().map(|settings| settings.job_concurrency).unwrap_or(1);
+        json!({"ok":true,"jobs":records,"owner_unavailable":true,"concurrency":concurrency,
             "retained_limit":HISTORY,"log_budget_bytes":LOG_BUDGET})
     }
 }

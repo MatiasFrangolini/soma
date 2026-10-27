@@ -116,6 +116,8 @@ soma-cli jobs logs --job ID --tail 200
 soma-cli jobs release --job ID --participant MI_PARTICIPACION
 ```
 
+`submit` requiere argumentos Maven después de `--` y no ejecuta un `test` implícito. `--help` antes de `--` muestra ayuda sin iniciar el dueño. Las opciones desconocidas de Soma se rechazan antes de iniciar un trabajo; después de `--`, los argumentos se entregan a Maven.
+
 `submit` abre/reutiliza Soma y devuelve `job_id` y `participant_id`. Pedidos iguales sobre el mismo checkout, entradas, entorno, selección y adaptador comparten el trabajo mientras está pendiente o activo. Después de terminar, otro pedido ejecuta Maven de nuevo. Guardá ambos IDs. Retirar tu participación solo cancela cuando no quedan otras; un timeout de `wait` conserva tu participación. Cerrar la ventana cancela todos sus trabajos. Consultar resultados o logs con la ventana cerrada no la abre.
 
 Los proyectos Maven nuevos reciben `test_configs`; en proyectos existentes agregá una configuración separada:

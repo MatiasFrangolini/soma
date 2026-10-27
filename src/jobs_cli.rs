@@ -7,6 +7,55 @@ fn flag(args: &[String], name: &str) -> Option<String> {
         .find(|a| a[0] == name && !a[1].starts_with("--"))
         .map(|a| a[1].clone())
 }
+
+// Reject malformed Soma options before contacting (or starting) the owner.
+// Maven's own arguments, including --help, start only after the separator.
+pub fn validate(args: &[String]) -> Result<(), String> {
+    let split = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let options = &args[..split];
+    let operation = options.first().map(String::as_str).unwrap_or("list");
+    let (values, switches): (&[&str], &[&str]) = match operation {
+        "submit" => (&["--path", "--config", "--kind", "--timeout", "--data-dir"], &["--wait"]),
+        "status" | "wait" => (&["--job", "--timeout", "--data-dir"], &[]),
+        "logs" => (&["--job", "--tail", "--data-dir"], &[]),
+        "release" => (&["--job", "--participant", "--data-dir"], &[]),
+        "configs" => (&["--path", "--data-dir"], &[]),
+        "list" => (&["--data-dir"], &[]),
+        _ => return Err("Comando jobs desconocido; usá help".into()),
+    };
+    let mut i = usize::from(!options.is_empty());
+    while i < options.len() {
+        let name = options[i].as_str();
+        if switches.contains(&name) { i += 1; continue; }
+        if !values.contains(&name) { return Err(format!("Opción desconocida: {name}")); }
+        if i + 1 == options.len() || options[i + 1].starts_with('-') {
+            return Err(format!("Falta el valor de {name}"));
+        }
+        if matches!(name, "--timeout" | "--tail") && options[i + 1].parse::<u64>().is_err() {
+            return Err(format!("{name} requiere un entero no negativo"));
+        }
+        i += 2;
+    }
+    if operation == "submit" && (split == args.len() || split + 1 == args.len()) {
+        return Err("Indicá los argumentos Maven después de --".into());
+    }
+    if operation != "submit" && split != args.len() {
+        return Err("El separador -- solo se admite en jobs submit".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod argument_tests {
+    use super::validate;
+
+    #[test]
+    fn maven_options_after_separator_are_not_soma_options() {
+        let args = ["submit", "--path", "checkout", "--", "--help"]
+            .into_iter().map(str::to_owned).collect::<Vec<_>>();
+        assert!(validate(&args).is_ok());
+    }
+}
 fn call(store: &Store, request: &Value, open: bool) -> Result<Value, ipc::RequestError> {
     if open {
         ipc::request_or_launch(store, request)
@@ -67,6 +116,7 @@ fn wait(store: &Store, id: &str, timeout: u64) -> Value {
     }
 }
 pub fn run(store: &Store, args: &[String]) -> Value {
+    if let Err(error) = validate(args) { return crate::error(error); }
     let split = args.iter().position(|a| a == "--").unwrap_or(args.len());
     let options = &args[..split];
     let timeout = flag(options, "--timeout")

@@ -140,7 +140,7 @@ try{
     Assert (-not (Get-Process -Id $crashPid -ErrorAction SilentlyContinue) -and (Job $crash.job_id).owner_unavailable) 'Unexpected owner exit releases its process tree and offline status refuses to invent completion'
     $null=Invoke-JobCli @('show')
     Assert ((Job $crash.job_id).job.state -eq 'interrupted' -and (Job $crashQueued.job_id).job.state -eq 'interrupted') 'Reopening records interrupted active and queued jobs without reexecuting them'
-    for($i=0;$i -lt 105;$i++){$null=Invoke-JobCli @('jobs','submit','--path',$fixture,'--config','tests','--kind','invalid')}
+    for($i=0;$i -lt 105;$i++){$null=Invoke-JobCli @('jobs','submit','--path',$fixture,'--config','tests','--kind','invalid','--','test')}
     $retained=(Invoke-JobCli @('jobs','list')).Value.jobs
     $allLogs=@(Get-ChildItem -LiteralPath (Join-Path $data 'jobs') -Filter '*.log' -File -Recurse)
     Assert (@($retained).Count -eq 100 -and ($allLogs|Measure-Object Length -Sum).Sum -le 30MB) 'Completed history prunes to 100 jobs and the total job log budget stays bounded'

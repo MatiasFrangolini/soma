@@ -8,7 +8,7 @@ use std::{
 };
 
 pub type Result<T> = std::result::Result<T, String>;
-#[derive(Clone, Serialize, Deserialize, Default)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
     #[serde(default = "version")]
@@ -19,6 +19,16 @@ pub struct Settings {
     pub maven_adapter: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub job_adapter: Option<CommandSpec>,
+    #[serde(default = "default_job_concurrency", skip_serializing_if = "is_default_job_concurrency")]
+    pub job_concurrency: usize,
+}
+fn default_job_concurrency() -> usize { 1 }
+fn is_default_job_concurrency(value: &usize) -> bool { *value == 1 }
+impl Default for Settings {
+    fn default() -> Self {
+        Self { schema_version: 1, projects: vec![], maven_adapter: None,
+            job_adapter: None, job_concurrency: default_job_concurrency() }
+    }
 }
 fn version() -> u32 {
     1
@@ -258,6 +268,9 @@ impl Store {
             serde_json::from_slice(&raw).map_err(|e| format!("projects.json inválido: {e}"))?;
         if value.schema_version != 1 {
             return Err("schema_version debe ser 1".into());
+        }
+        if !(1..=3).contains(&value.job_concurrency) {
+            return Err("job_concurrency debe estar entre 1 y 3".into());
         }
         let mut ids = std::collections::HashSet::new();
         for p in &value.projects {

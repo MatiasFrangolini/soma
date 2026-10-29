@@ -57,6 +57,9 @@ jobs:
       - name: CLI argument safety
         shell: pwsh
         run: ./tests/cli-arguments.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-arguments-qa')
+      - name: Job output, profiles and metadata contracts
+        shell: pwsh
+        run: ./tests/job-output.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-job-output-qa') -Jdk $env:JAVA_HOME_21_X64
       - name: Process contracts
         shell: pwsh
         run: ./tests/verify.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-process-qa') -Jdk $env:JAVA_HOME_21_X64
@@ -87,6 +90,7 @@ jobs:
             ${{ runner.temp }}/soma-targets-qa/targets-failure.json
             ${{ runner.temp }}/soma-targets-qa/targets-failure.log
             ${{ runner.temp }}/soma-jobs-qa/jobs-verification.json
+            ${{ runner.temp }}/soma-job-output-qa/job-output-verification.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: soma-windows-release

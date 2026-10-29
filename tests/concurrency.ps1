@@ -1,5 +1,5 @@
 #requires -Version 7.0
-param([Parameter(Mandatory)][string]$BinaryDirectory,[Parameter(Mandatory)][string]$Workspace,[Parameter(Mandatory)][string]$Jdk)
+param([Parameter(Mandatory)][string]$BinaryDirectory,[Parameter(Mandatory)][string]$Workspace,[Parameter(Mandatory)][string]$Jdk,[string]$JobAdapterFile)
 $ErrorActionPreference='Stop'
 $PSNativeCommandUseErrorActionPreference=$false
 $cli=Join-Path $BinaryDirectory 'soma-cli.exe'
@@ -21,7 +21,9 @@ foreach($name in @('a','b')){
     Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'JobProbeTest.java') -Destination (Join-Path $fixture 'src/test/java/JobProbeTest.java')
     $projects+=@{id=$name;name=$name;directory=$fixture;configs=@();test_configs=@(@{id='tests';name='tests';jdk=$Jdk;env=@{SOMA_TEST_MODE='test-only'};inputs=@('pom.xml','src')})}
 }
-@{schema_version=1;job_concurrency=2;projects=$projects}|ConvertTo-Json -Depth 12|Set-Content -LiteralPath (Join-Path $data 'projects.json')
+$settings=@{schema_version=1;job_concurrency=2;projects=$projects}
+if($JobAdapterFile){$settings.job_adapter=Get-Content -LiteralPath $JobAdapterFile -Raw|ConvertFrom-Json -AsHashtable}
+$settings|ConvertTo-Json -Depth 12|Set-Content -LiteralPath (Join-Path $data 'projects.json')
 function Invoke-Cli([string[]]$Arguments){
     $raw=& $cli @Arguments
     try{$raw|ConvertFrom-Json}catch{throw "Invalid CLI JSON: $raw"}

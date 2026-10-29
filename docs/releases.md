@@ -5,10 +5,10 @@ El repositorio incluye fuente Rust, icono, pruebas, empaquetado y bucket de Scoo
 Para publicar una versión:
 
 1. Modificá el código. Subí la versión de `Cargo.toml` y la entrada de Soma en `Cargo.lock` siguiendo `major.minor.patch`.
-2. Validá los cambios y guardalos en un commit en `main`.
-3. Ejecutá `pwsh ./scripts/Release.ps1`.
+2. Validá localmente los cambios y el bundle completo. Durante el desarrollo mantené las pruebas en tu checkout; no publiques tags ni versiones intermedias.
+3. Cuando la entrega esté lista y se decida publicarla, guardá el commit final en `main` con `[release-only]` y ejecutá una sola vez `pwsh ./scripts/Release.ps1`.
 
-El script sube `main` y el tag correspondiente. GitHub Actions compila Windows x64, ejecuta los tests Rust y las pruebas de procesos, distribución, worktrees, readiness y trabajos Maven reales, genera un ZIP con SHA-256 y publica una release. Después actualiza `bucket/soma.json` en `main`. No se publica ningún paquete si falla la compilación o las pruebas. Conviene esperar el CI de `main` antes de crear el tag.
+El script publica inmediatamente: sube `main` y el tag correspondiente. GitHub Actions compila Windows x64, ejecuta los tests Rust y las pruebas de procesos, distribución, worktrees, readiness y trabajos Maven reales, genera un ZIP con SHA-256 y publica una release. Después actualiza `bucket/soma.json` en `main`. No se publica ningún paquete si falla la compilación o las pruebas.
 
 Para una entrega ya validada en su rama, el commit final de `main` puede incluir `[release-only]`: ese push no consume un build duplicado de `main`, pero el workflow del tag sigue ejecutando todas las comprobaciones antes de publicar. No uses la marca sin verificar previamente la rama y crear inmediatamente el tag de la misma versión.
 

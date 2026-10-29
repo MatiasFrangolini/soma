@@ -6,14 +6,33 @@ fn flag(args: &[String], name: &str) -> Option<String> {
     args.windows(2).find(|a| a[0] == name).map(|a| a[1].clone())
 }
 pub fn run() -> i32 {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "--data-dir") {
+        if args.len() < 3 || args[1].starts_with('-') {
+            return print(crate::error("Usá --data-dir DIRECTORIO COMANDO"));
+        }
+        let data = args.drain(..2).collect::<Vec<_>>();
+        let position = args.iter().position(|arg| arg == "--").unwrap_or(args.len());
+        args.splice(position..position, data);
+    }
     let cmd = args.first().map(String::as_str).unwrap_or("help");
+    if matches!(cmd, "--version" | "-V" | "version") {
+        if args.len() == 1 {
+            println!("Soma {}", env!("CARGO_PKG_VERSION"));
+            return 0;
+        }
+        if args.len() == 2 && args[1] == "--json" {
+            return print(json!({"ok":true,"name":"Soma","version":env!("CARGO_PKG_VERSION")}));
+        }
+        return print(crate::error("Usá version [--json]"));
+    }
     // Help belongs to Soma only before the Maven argument separator. In
     // particular, it must never submit a job or initialise the data store.
     let options = &args[..args.iter().position(|arg| arg == "--").unwrap_or(args.len())];
     if matches!(cmd, "help" | "--help" | "-h")
+        || (cmd == "jobs" && args.get(1).is_some_and(|arg| arg == "help"))
         || options.iter().any(|arg| matches!(arg.as_str(), "--help" | "-h")) {
-        println!("Soma {} — agente y ventana comparten una ejecución\n\n  projects [--json]\n  add --path DIRECTORIO\n  configs --project ID\n  presets\n  apply-preset --project ID [--preset jvm-optimized] [--from-config ID]\n  validate\n  config-path\n  status [--operation ID] [--health]\n  worktrees --path DIRECTORIO\n  branches --path DIRECTORIO\n  switch --path DIRECTORIO --branch RAMA\n  run --path DIRECTORIO [--config ID] [--reuse] [--wait-ready] [--health-url URL]\n  build --project ID [--config ID] [--wait]\n  wait --operation ID [--ready] [--timeout 600]\n  restart [--project ID] [--config ID]\n  stop [--operation ID]\n  logs [--operation ID] [--tail 200 | --after CURSOR] [--contains TEXTO]\n  jobs submit --path DIRECTORIO --config tests --kind test|build [--wait] -- ARGUMENTOS_MAVEN\n  jobs configs --path DIRECTORIO\n  jobs list\n  jobs status|wait|logs --job ID\n  jobs release --job ID --participant ID\n  show\n  close\n\nTodas las respuestas de operación son JSON. --data-dir PATH / SOMA_HOME cambia el almacenamiento.\nRun admite --project ID o --path y compila antes de iniciar. --reuse exige un build vigente.\n--wait espera la salida; --wait-ready espera la API. Stop con --operation rechaza un ID ajeno. El cierre de la ventana detiene sus procesos.", env!("CARGO_PKG_VERSION"));
+        println!("Soma {} — agente y ventana comparten una ejecución\n\n  version [--json]\n  projects [--json]\n  add --path DIRECTORIO\n  configs --project ID\n  presets\n  apply-preset --project ID [--preset jvm-optimized] [--from-config ID]\n  validate\n  config-path\n  status [--operation ID] [--health]\n  worktrees --path DIRECTORIO\n  branches --path DIRECTORIO\n  switch --path DIRECTORIO --branch RAMA\n  run --path DIRECTORIO [--config ID] [--reuse] [--wait-ready] [--health-url URL]\n  build --project ID [--config ID] [--wait]\n  wait --operation ID [--ready] [--timeout 600]\n  restart [--project ID] [--config ID]\n  stop [--operation ID]\n  logs [--operation ID] [--tail 200 | --after CURSOR] [--contains TEXTO]\n  jobs submit --path DIRECTORIO --config tests --kind test|build [--wait] -- ARGUMENTOS_MAVEN\n  jobs configs --path DIRECTORIO\n  jobs list [--path DIR] [--state ESTADOS] [--limit N] [--history] [--summary]\n  jobs status|wait --job ID [--summary]\n  jobs logs --job ID [--tail N | --after CURSOR] [--contains TEXTO]\n  jobs doctor --path DIR [--config tests] [--require docker]\n  jobs config-clone --path DIR --from ID --to ID [--env-file FILE] [--to-data-dir DIR]\n  jobs release --job ID --participant ID\n  show\n  close\n\nTodas las respuestas de operación son JSON. --data-dir PATH / SOMA_HOME cambia el almacenamiento.\nRun admite --project ID o --path y compila antes de iniciar. --reuse exige un build vigente.\n--wait espera la salida; --wait-ready espera la API. Stop con --operation rechaza un ID ajeno. El cierre de la ventana detiene sus procesos.", env!("CARGO_PKG_VERSION"));
         return 0;
     }
     if cmd == "jobs" {
@@ -40,8 +59,10 @@ pub fn run() -> i32 {
             return print(crate::error("--after consume datos nuevos; no se combina con --tail"));
         }
     }
-    if let Err(e) = store.initialize() {
-        return print(crate::error(e));
+    if !(cmd == "jobs" && args.get(1).is_some_and(|arg| arg == "doctor")) {
+        if let Err(e) = store.initialize() {
+            return print(crate::error(e));
+        }
     }
     if cmd == "jobs" {
         return print(crate::jobs_cli::run(&store, &args[1..]));

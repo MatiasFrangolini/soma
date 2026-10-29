@@ -8,6 +8,33 @@ use std::{
 };
 
 pub type Result<T> = std::result::Result<T, String>;
+
+// Serialize Soma's read/modify/write transactions across GUI owners and CLIs.
+// External editors are detected by the byte comparison before replacement.
+struct SettingsLock(windows_sys::Win32::Foundation::HANDLE);
+impl SettingsLock {
+    fn acquire(path: &Path) -> Result<Self> {
+        use windows_sys::Win32::{Foundation::*, System::Threading::*};
+        let key = format!("{:x}", Sha256::digest(path.to_string_lossy().to_lowercase().as_bytes()));
+        let name = crate::wide(&format!("Local\\SomaSettings-{key}"));
+        unsafe {
+            let handle = CreateMutexW(std::ptr::null(), 0, name.as_ptr());
+            if handle.is_null() { return Err("No se pudo proteger projects.json".into()); }
+            match WaitForSingleObject(handle, 5000) {
+                WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self(handle)),
+                _ => { CloseHandle(handle); Err("Otra operación está editando projects.json".into()) }
+            }
+        }
+    }
+}
+impl Drop for SettingsLock {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Settings {
@@ -204,6 +231,7 @@ impl Store {
     pub fn initialize(&self) -> Result<()> {
         fs::create_dir_all(self.home.join("logs")).map_err(|e| e.to_string())?;
         fs::create_dir_all(self.home.join("builds")).map_err(|e| e.to_string())?;
+        let _guard = SettingsLock::acquire(&self.path())?;
         let installed_home =
             std::env::var_os("USERPROFILE").map(|p| PathBuf::from(p).join(".soma"));
         if installed_home.as_ref() == Some(&self.home) && !self.path().exists() {
@@ -264,8 +292,17 @@ impl Store {
     }
     pub fn load(&self) -> Result<Settings> {
         let raw = fs::read(self.path()).map_err(|e| e.to_string())?;
-        let value: Settings =
-            serde_json::from_slice(&raw).map_err(|e| format!("projects.json inválido: {e}"))?;
+        let value: Settings = serde_json::from_slice(&raw).map_err(|error| {
+            let reason = match error.classify() {
+                serde_json::error::Category::Data => "tipos o campos no admitidos",
+                serde_json::error::Category::Syntax => "sintaxis inválida",
+                serde_json::error::Category::Eof => "contenido incompleto",
+                serde_json::error::Category::Io => "error de lectura",
+            };
+            // A serde type error may embed the offending value, including an
+            // environment secret. Location and category suffice for diagnosis.
+            format!("projects.json inválido: {reason}, línea {}, columna {}", error.line(), error.column())
+        })?;
         if value.schema_version != 1 {
             return Err("schema_version debe ser 1".into());
         }
@@ -302,11 +339,13 @@ impl Store {
         Ok(value)
     }
     pub fn save(&self, value: &Settings) -> Result<()> {
+        let _guard = SettingsLock::acquire(&self.path())?;
         let temp = self.home.join("projects.json.tmp");
         fs::write(&temp, serde_json::to_vec_pretty(value).unwrap()).map_err(|e| e.to_string())?;
         fs::rename(temp, self.path()).map_err(|e| e.to_string())
     }
     pub fn apply_preset(&self, project: &str, preset: &str, from: Option<&str>) -> Result<bool> {
+        let _guard = SettingsLock::acquire(&self.path())?;
         let preset_config = JavaPreset::optimized()?;
         if preset != preset_config.id { return Err("Preset no encontrado; usá presets".into()); }
         let mut settings = self.load()?;
@@ -354,6 +393,38 @@ impl Store {
             })
             .map(|p| p.id.clone())
             .ok_or_else(|| "Proyecto no registrado: usá add --path DIRECTORIO".into())
+    }
+    pub(crate) fn test_target(&self, directory: &Path, config: &str) -> Result<(Settings, Project, TestConfig)> {
+        let directory = plain(fs::canonicalize(directory).map_err(|_| "El checkout no existe")?);
+        let settings = self.load()?;
+        let source = settings.projects.iter().find(|p| p.directory == directory)
+            .or_else(|| settings.projects.iter().find(|p| crate::git::same_project(&p.directory, &directory)))
+            .ok_or("Proyecto no registrado: usá add --path DIRECTORIO")?;
+        let mut test = source.test_configs.iter().find(|c| c.id == config)
+            .ok_or("Configuración de pruebas no encontrada; agregala en test_configs")?.clone();
+        let rebase = |value: &mut String| {
+            if let Ok(relative) = Path::new(value).strip_prefix(&source.directory) {
+                *value = directory.join(relative).to_string_lossy().into();
+            }
+        };
+        if let Some(value) = &mut test.env_file { rebase(value); }
+        if let Some(value) = &mut test.jdk { rebase(value); }
+        for value in &mut test.inputs { rebase(value); }
+        let mut project = source.clone();
+        project.directory = directory;
+        project.selected_worktree = None;
+        Ok((settings, project, test))
+    }
+    pub(crate) fn edit<T>(&self, change: impl FnOnce(&mut Settings) -> Result<T>) -> Result<T> {
+        let _guard = SettingsLock::acquire(&self.path())?;
+        let expected = fs::read(self.path()).map_err(|e| e.to_string())?;
+        let mut settings = self.load()?;
+        let result = change(&mut settings)?;
+        if fs::read(self.path()).map_err(|e| e.to_string())? != expected {
+            return Err("projects.json cambió durante la edición; no se reemplazó".into());
+        }
+        self.save(&settings)?;
+        Ok(result)
     }
     pub fn target(
         &self,
@@ -414,6 +485,7 @@ impl Store {
         Ok((p, c))
     }
     pub fn select_worktree(&self, project: &str, directory: &Path) -> Result<()> {
+        let _guard = SettingsLock::acquire(&self.path())?;
         let mut settings = self.load()?;
         let p = settings
             .projects
@@ -428,6 +500,7 @@ impl Store {
         self.save(&settings)
     }
     pub fn add_directory(&self, path: &Path) -> Result<String> {
+        let _guard = SettingsLock::acquire(&self.path())?;
         let dir = plain(fs::canonicalize(path).map_err(|e| e.to_string())?);
         let mut s = self.load()?;
         if let Some(p) = s.projects.iter().find(|p| p.directory == dir) {
@@ -714,25 +787,40 @@ pub fn hash_file(path: &Path) -> Result<String> {
     feed_file(path, &mut h)?;
     Ok(format!("{:x}", h.finalize()))
 }
-fn feed_file(path: &Path, h: &mut Sha256) -> Result<()> {
+fn feed_file(path: &Path, h: &mut Sha256) -> Result<u64> {
     let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
     let mut b = [0; 65536];
+    let mut bytes = 0;
     loop {
         let n = f.read(&mut b).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
         h.update(&b[..n]);
+        bytes += n as u64;
     }
-    Ok(())
+    Ok(bytes)
 }
 pub fn fingerprint(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> Result<String> {
+    fingerprint_observed(p, c, env).map(|(key, _)| key)
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct FingerprintTimings {
+    pub scan_ms: u64,
+    pub git_ms: u64,
+    pub hash_ms: u64,
+    pub files: usize,
+    pub bytes: u64,
+}
+pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> Result<(String, FingerprintTimings)> {
+    let clock = std::time::Instant::now();
     let mut files = Vec::new();
     for input in &c.inputs {
         walk(&resolve(p, input), c, &p.directory, &mut files)?;
     }
     files.sort();
     files.dedup();
+    let mut observed = FingerprintTimings { scan_ms: clock.elapsed().as_millis() as u64, files: files.len(), ..Default::default() };
     let mut h = Sha256::new();
     h.update(p.directory.to_string_lossy().as_bytes());
     let mut build_config = c.clone();
@@ -740,6 +828,7 @@ pub fn fingerprint(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> R
     h.update(serde_json::to_vec(&build_config).unwrap());
     // Build tools may interpolate any environment value. Persist only the digest.
     h.update(serde_json::to_vec(env).unwrap());
+    let clock = std::time::Instant::now();
     h.update(branch(&p.directory));
     use std::os::windows::process::CommandExt;
     if let Ok(o) = std::process::Command::new("git")
@@ -751,6 +840,8 @@ pub fn fingerprint(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> R
             h.update(o.stdout);
         }
     }
+    observed.git_ms = clock.elapsed().as_millis() as u64;
+    let clock = std::time::Instant::now();
     for path in files {
         h.update(
             path.strip_prefix(&p.directory)
@@ -759,8 +850,9 @@ pub fn fingerprint(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> R
                 .as_bytes(),
         );
         h.update([0]);
-        feed_file(&path, &mut h)?;
+        observed.bytes += feed_file(&path, &mut h)?;
         h.update([0]);
     }
-    Ok(format!("{:x}", h.finalize()))
+    observed.hash_ms = clock.elapsed().as_millis() as u64;
+    Ok((format!("{:x}", h.finalize()), observed))
 }

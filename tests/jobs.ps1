@@ -57,12 +57,17 @@ $settings=@{schema_version=1;projects=@(@{id='probe';name='Jobs fixture';directo
 $settings|ConvertTo-Json -Depth 15|Set-Content -LiteralPath (Join-Path $data 'projects.json')
 try{
     Assert ((Invoke-JobCli @('validate')).Value.ok) 'Separate runtime and test configurations validate'
-    $first=Submit 'sleep' 'test' @('--define=private.canary=soma-private-argument-fixture')
+    $sharedArguments=@('--define=private.canary=soma-private-argument-fixture','--define','another.canary=soma-private-argument-fixture','-D','test=JobProbeTest')
+    $first=Submit 'sleep' 'test' $sharedArguments
     Assert ($first.ok -and $first.job_id -and $first.participant_id) 'Submit returns a job and a participant'
     $owner=Get-CimInstance Win32_Process -Filter "Name='Soma.exe'"|Where-Object CommandLine -like "*$data*"|Select-Object -First 1
     Assert ($null -ne $owner -and (Get-Process -Id $owner.ProcessId).MainWindowHandle -eq 0) 'Maven submit starts a temporary owner without a window'
     Wait-Started $first.job_id
-    $same=Submit 'sleep' 'test' @('--define=private.canary=soma-private-argument-fixture')
+    $initialLogs=(Invoke-JobCli @('jobs','logs','--job',$first.job_id,'--tail','10')).Value
+    Assert ([bool]$initialLogs.cursor -and $initialLogs.job_id -eq $first.job_id) 'Active Maven logs expose a cursor scoped to their canonical job'
+    $activeSummary=(Invoke-JobCli @('jobs','status','--job',$first.job_id,'--summary')).Value
+    Assert ($activeSummary.verdict -eq 'pending' -and $activeSummary.next_action -eq 'wait' -and $activeSummary.directory -eq $fixture -and $activeSummary.selection.tests -contains 'test=JobProbeTest') 'Compact active status keeps checkout, split-form test selection and progress distinct from validation'
+    $same=Submit 'sleep' 'test' $sharedArguments
     Assert ($same.ok -and $same.deduplicated -and $same.job_id -eq $first.job_id -and $same.participant_id -ne $first.participant_id) 'Two agents share one active Maven execution with independent participation'
     $queued=Submit 'pass'
     Assert ((Job $queued.job_id).job.state -eq 'queued') 'Another Maven request queues behind the active job'
@@ -74,6 +79,11 @@ try{
     Assert ($done.Code -eq 0 -and $done.Value.job.evidence.tests -eq 3 -and $done.Value.job.evidence.executed -eq 2 -and $done.Value.job.evidence.skipped -eq 1) 'Real Surefire evidence reports executed and explicitly skipped tests'
     Assert (@(Get-Content -LiteralPath (Join-Path $fixture 'invocations.txt')).Count -eq 1) 'Joined and cancelled requests did not execute JUnit again'
     $timing=$done.Value.job.timings
+    Assert ($timing.preparation.fingerprint.files -ge 3 -and $timing.preparation.fingerprint.bytes -gt 0 -and $null -ne $timing.pre_execution -and $null -ne $timing.final_verification -and $null -ne $timing.report_collection_ms) 'Real jobs record input scan, hash volume and both validity checks separately from XML collection'
+    $incremental=(Invoke-JobCli @('jobs','logs','--job',$same.job_id,'--after',$initialLogs.cursor,'--contains','BUILD SUCCESS')).Value
+    Assert ($incremental.ok -and $incremental.text.Contains('BUILD SUCCESS') -and $incremental.cursor -ne $initialLogs.cursor) 'Incremental filtered reads advance across all consumed bytes, including unmatched lines'
+    $drained=(Invoke-JobCli @('jobs','logs','--job',$same.job_id,'--after',$incremental.cursor)).Value
+    Assert ($drained.ok -and $drained.text -eq '' -and $drained.cursor -eq $incremental.cursor) 'Reusing a drained cursor does not replay Maven log lines'
     Assert (-not ($done.Value.job|ConvertTo-Json -Depth 12 -Compress).Contains('soma-private-argument-fixture')) 'Long-form Maven property values stay out of requested and effective JSON metadata'
     Assert ($null -ne $timing.resource_wait_ms -and $timing.maven_ms -gt 12000 -and $timing.total_ms -ge $timing.maven_ms) 'JSON separates measured preparation, queue, adapter waiting and Maven wall time'
     $deadline=[DateTime]::UtcNow.AddSeconds(15)
@@ -83,6 +93,8 @@ try{
     $null=Invoke-JobCli @('show')
     $owner=Get-CimInstance Win32_Process -Filter "Name='Soma.exe'"|Where-Object CommandLine -like "*$data*"|Select-Object -First 1
     $again=Submit 'pass';$againDone=Wait-Job $again.job_id
+    $wrongScope=Invoke-JobCli @('jobs','logs','--job',$again.job_id,'--after',$initialLogs.cursor)
+    Assert ($wrongScope.Value.code -eq 'cursor_expired') 'A job cannot consume a cursor from a different execution'
     Assert ($again.job_id -ne $same.job_id -and $againDone.Code -eq 0 -and @(Get-Content -LiteralPath (Join-Path $fixture 'invocations.txt')).Count -eq 2) 'A finished green result is not automatically reused'
     $failed=Submit 'fail';$failedDone=Wait-Job $failed.job_id
     $failureDetail=@($failedDone.Value.job.evidence.details|Where-Object outcome -eq 'failure')
@@ -90,7 +102,8 @@ try{
     $empty=Submit 'pass' 'test' @('-Dtest=MissingTest','-Dsurefire.failIfNoSpecifiedTests=false');$emptyDone=Wait-Job $empty.job_id
     Assert ($emptyDone.Code -eq 11 -and $emptyDone.Value.job.exit_code -eq 0 -and $emptyDone.Value.job.evidence.status -eq 'no_tests') 'Zero tests cannot reuse previous XML or produce a green validation'
     $mutated=Submit 'mutate';$mutatedDone=Wait-Job $mutated.job_id
-    Assert ($mutatedDone.Code -eq 10 -and $mutatedDone.Value.job.state -eq 'invalidated') 'Changes during a passing test invalidate its result'
+    $mutatedSummary=Invoke-JobCli @('jobs','wait','--job',$mutated.job_id,'--summary')
+    Assert ($mutatedDone.Code -eq 10 -and $mutatedDone.Value.job.state -eq 'invalidated' -and $mutatedSummary.Code -eq 10 -and $mutatedSummary.Value.verdict -eq 'invalidated') 'Changes during a passing test invalidate full and compact outcomes'
     $build=Submit 'pass' 'build';$buildDone=Wait-Job $build.job_id
     Assert ($buildDone.Code -eq 0 -and $buildDone.Value.job.evidence.status -eq 'not_requested') 'A build can succeed without claiming test validation'
     $outside=(Invoke-JobCli @('jobs','submit','--path',$fixture,'--config','tests','--','-f','../other/pom.xml','test')).Value
@@ -141,8 +154,11 @@ try{
     $null=Invoke-JobCli @('show')
     Assert ((Job $crash.job_id).job.state -eq 'interrupted' -and (Job $crashQueued.job_id).job.state -eq 'interrupted') 'Reopening records interrupted active and queued jobs without reexecuting them'
     for($i=0;$i -lt 105;$i++){$null=Invoke-JobCli @('jobs','submit','--path',$fixture,'--config','tests','--kind','invalid','--','test')}
-    $retained=(Invoke-JobCli @('jobs','list')).Value.jobs
+    $retainedList=(Invoke-JobCli @('jobs','list')).Value
+    $retained=$retainedList.jobs
     $allLogs=@(Get-ChildItem -LiteralPath (Join-Path $data 'jobs') -Filter '*.log' -File -Recurse)
-    Assert (@($retained).Count -eq 100 -and ($allLogs|Measure-Object Length -Sum).Sum -le 30MB) 'Completed history prunes to 100 jobs and the total job log budget stays bounded'
+    Assert (@($retained).Count -eq 100 -and $retainedList.matched -eq 100 -and ($allLogs|Measure-Object Length -Sum).Sum -le 30MB) 'Detailed history prunes to 100 jobs and the total job log budget stays bounded'
+    $archived=Invoke-JobCli @('jobs','wait','--job',$first.job_id,'--summary')
+    Assert ($archived.Code -eq 0 -and $archived.Value.archived -and $archived.Value.evidence.executed -eq 2 -and $archived.Value.head -eq $done.Value.job.head) 'Real Maven evidence survives detailed-history retirement as compact metadata'
     [ordered]@{Result='PASS';Checks=@($checks.ToArray());IdleWorkingSetMiB=[Math]::Round($loadedIdle/1MB,2);ReopenedWorkingSetMiB=[Math]::Round($idle/1MB,2);SampleTimings=$timing;Data=$data}|ConvertTo-Json -Depth 10|Set-Content -LiteralPath (Join-Path $Workspace 'jobs-verification.json')
 }finally{$null=Invoke-JobCli @('close')}

@@ -39,7 +39,7 @@ Soma no requiere Codex, IA, cuentas de servicios, Rust, IntelliJ, .NET ni Java p
 - **Stop** solicita Ctrl+C; tras 15 segundos puede finalizar únicamente su árbol de procesos.
 - **Terminal** abre una terminal externa en la carpeta del proyecto.
 
-Cerrar Soma detiene la aplicación y los trabajos que inició. Solo hay una aplicación y un trabajo Maven activo por dueño, tenga o no interfaz abierta. Los logs visibles del backend se limitan a 2 MiB y el disco a tres segmentos de 10 MiB.
+Cerrar Soma detiene la aplicación y los trabajos que inició. Hay una aplicación por dueño y hasta `job_concurrency` trabajos Maven activos, en checkouts distintos, tenga o no interfaz abierta. Los logs visibles del backend se limitan a 2 MiB y el disco a tres segmentos de 10 MiB.
 
 La CLI distingue una ventana cerrada de un canal local inaccesible. Si Windows deniega la conexión, devuelve `ok:false`, `code:"access_denied"` y `os_error:5`; no abre otra instancia, no informa `closed`/`stopped` y no reemplaza la consulta por datos históricos. Otros errores de conexión devuelven `ipc_unavailable`. Solo la ausencia del canal permite abrir Soma o consultar el historial offline. Ejecutá la CLI desde un contexto autorizado para acceder al dueño existente; no es necesario reiniciarlo ni ampliar los permisos del canal.
 
@@ -109,14 +109,47 @@ Usá el directorio de datos habitual para compartir el dueño y la cola. Reserv�
 ```powershell
 soma-cli jobs configs --path C:\repos\mi-worktree
 soma-cli jobs submit --path C:\repos\mi-worktree --config tests --kind test -- -pl commons -am -Dtest=ExampleTest -Dsurefire.failIfNoSpecifiedTests=false test
-soma-cli jobs list
-soma-cli jobs wait --job ID --timeout 600
+soma-cli jobs list --path C:\repos\mi-worktree --summary --limit 10
+soma-cli jobs wait --job ID --timeout 600 --summary
 soma-cli jobs status --job ID
 soma-cli jobs logs --job ID --tail 200
 soma-cli jobs release --job ID --participant MI_PARTICIPACION
 ```
 
 `submit` requiere argumentos Maven después de `--` y no ejecuta un `test` implícito. `--help` antes de `--` muestra ayuda sin iniciar el dueño. Las opciones desconocidas de Soma se rechazan antes de iniciar un trabajo; después de `--`, los argumentos se entregan a Maven.
+
+`version` / `--version` y `jobs help` no abren Soma ni crean datos. `version --json` devuelve la versión estructurada. `--data-dir DIRECTORIO` también puede preceder al comando.
+
+### Resultados compactos y consultas
+
+`jobs status --summary`, `jobs wait --summary` y `jobs submit --summary` devuelven los campos en la raíz: `job_id`, `state`, `verdict`, `exit_code`, `evidence`, `directory`, `branch`, `head`, `selection`, `timings` y `next_action`. El JSON completo de status/wait sigue disponible omitiendo `--summary`; sus campos están dentro de `job`. Un submit sin `--wait` confirma la aceptación; no convierte su resumen en validación final.
+
+`status` con `ok:true` y salida 0 confirma la consulta, incluso si `verdict` es `failed`. Para completar una validación usá `wait`: conserva los códigos de error del resultado completo. `verdict` puede ser `passed`, `passed_with_skips`, `built`, `failed`, `incomplete`, `invalidated`, `cancelled`, `interrupted`, `pending` o `unknown`. `built` no acredita tests. Un código Maven distinto de cero, la falta de evidencia o un cambio de entradas nunca se convierten en éxito por usar el resumen. Un estado activo leído sin dueño disponible se informa como desconocido; no prueba progreso actual.
+
+`jobs list --path DIRECTORIO --state failed,invalidated --limit 20 --summary` filtra el checkout exacto y los estados, ordena del más reciente al más antiguo y devuelve `matched` / `has_more`. Sin `--limit` devuelve los trabajos retenidos; el límite máximo es 1228 (100 detallados, 128 pendientes y 1000 archivados). La forma compacta es la misma con dueño disponible o leyendo desde disco; `participants` sólo está disponible al consultar al dueño. El resumen omite argumentos completos y stacks; conserva la selección y el primer fallo acotado.
+
+Para agentes: iniciá `jobs wait --timeout 600 --summary` en una sesión no bloqueante del anfitrión, conservá su identificador de terminal y revisá esa sesión con esperas acotadas. Evitá encadenar `wait --timeout 1`, `status` y el mismo `tail` sin un cambio que diagnosticar. Un timeout mantiene activos el trabajo y la participación; retirate con tu `participant_id` si abandonás trabajo pendiente. `wait` consulta internamente el estado cada 250 ms; no es una suscripción a eventos.
+
+### Logs incrementales de trabajos
+
+`jobs logs --job ID --tail 100` devuelve un `cursor` ligado al historial del trabajo canónico. Para continuar usá `jobs logs --job ID --after CURSOR`, opcionalmente con `--contains TEXTO`. El cursor avanza por los bytes consumidos, incluidas las líneas descartadas por el filtro. No se combina `--after` con `--tail`. `has_more` pide continuar con el cursor devuelto; una lectura vacía no termina el job.
+
+Los cursores no se pueden compartir entre trabajos; una rotación o historial distinto puede devolver `cursor_expired`, que requiere una lectura inicial nueva. `job_logs_unavailable` indica logs retirados por retención, aunque siga disponible la metadata del resultado. Las lecturas están acotadas y funcionan después del cierre del dueño. `source:disk` describe la lectura de archivos, no la salud de un proceso.
+
+### Comprobar y clonar configuraciones de pruebas
+
+```powershell
+soma-cli jobs doctor --path C:\repos\mi-worktree --config tests
+soma-cli jobs doctor --path C:\repos\mi-worktree --config tests --require docker
+soma-cli jobs config-clone --path C:\repos\mi-worktree --from tests --to isolated --env-file C:\private\tests.env --to-data-dir C:\private\soma-tests
+soma-cli jobs doctor --path C:\repos\mi-worktree --config isolated --data-dir C:\private\soma-tests
+```
+
+`doctor` inspecciona el proyecto, la configuración de tests, el JDK, el Wrapper y los archivos del adaptador sin ejecutar Maven, tests ni el adaptador. `--require docker` consulta el daemon con un plazo de cinco segundos. No valida compatibilidad de Testcontainers, bases, permisos ni credenciales. No imprime valores del entorno ni el contenido de archivos inválidos; no hereda la configuración del runtime y no inicia un dueño.
+
+`config-clone` conserva entradas, exclusiones, JDK y entorno de la configuración de tests elegida. `--env-file` reemplaza explícitamente su archivo de variables; el destino debe tener un ID nuevo. Sin `--to-data-dir`, agrega la configuración al proyecto actual. Con esa opción prepara un proyecto de tests para el checkout exacto en otro directorio de datos: conserva el adaptador y la concurrencia de origen al crearlo, y rechaza destinos con otro `job_adapter` o un proyecto del mismo ID para otro checkout. No altera el origen ni copia la configuración de ejecución. Las ediciones de Soma se serializan y reemplazan el JSON atómicamente, preservando las entradas ajenas. No se sobrescriben configuraciones existentes.
+
+Un clon compartido conserva las rutas internas referidas al proyecto registrado y las resuelve para cada checkout al usarse; un clon aislado conserva las rutas del checkout elegido. Las rutas externas explícitas permanecen externas.
 
 `submit` abre/reutiliza Soma y devuelve `job_id` y `participant_id`. Pedidos iguales sobre el mismo checkout, entradas, entorno, selección y adaptador comparten el trabajo mientras está pendiente o activo. Después de terminar, otro pedido ejecuta Maven de nuevo. Guardá ambos IDs. Retirar tu participación solo cancela cuando no quedan otras; un timeout de `wait` conserva tu participación. Cerrar la ventana cancela todos sus trabajos. Consultar resultados o logs con la ventana cerrada no la abre.
 
@@ -139,7 +172,13 @@ Los resultados JSON conservan checkout, rama/HEAD, huella de entradas y configur
 
 `timings` separa preparación, cola de Soma/checkout, espera del adaptador, ejecución y recolección de evidencia. `resource_wait_ms` incluye arranque del adaptador, admisión y evento del hijo; `maven_ms` incluye el Wrapper y el pequeño cierre del proxy. `test_reported_ms` proviene del XML y no se suma como otra fase del tiempo total. Son mediciones de pared, no un desglose interno de Maven ni una promesa de acelerar la compilación.
 
-Se retienen 100 trabajos finalizados y hasta 30 MiB de logs de trabajos en total, aparte del backend. Cada trabajo activo usa un buffer de 64 KiB y hasta tres segmentos de 1 MiB. La cola admite 128 pedidos pendientes y cada trabajo 128 participaciones. Las 128 referencias intermedias más recientes se conservan; usá el ID canónico devuelto por Submit. Al volver a abrir después de una interrupción se registra `interrupted`, sin reejecutar automáticamente.
+El resultado completo incluye `timings.preparation`, `pre_execution` y `final_verification`: reactor, configuración, entorno, adaptador y `fingerprint` (`scan_ms`, `git_ms`, `hash_ms`, `files`, `bytes`). `report_collection_ms` separa el XML de la comprobación final. Son submediciones de fases ya incluidas en los tiempos anteriores; no se suman otra vez. Las verificaciones de contenido se mantienen antes y después de Maven; no se sustituyen por fechas de modificación.
+
+Se retienen 100 resultados detallados y hasta 30 MiB de logs de trabajos en total, aparte del backend. Al retirar un resultado detallado se conserva metadata sin stacks en `job-history`, limitada a 1000 registros, 16 MiB y 30 días; la poda ocurre al abrir el dueño o archivar resultados. `jobs status/wait --job ID` también consultan ese archivo, con `archived:true`, `details_retained:false` y disponibilidad de logs explícita. Usá `jobs list --history --summary --limit 1000` para incluirlo y redirigí su JSON a un archivo si necesitás exportarlo. La metadata no acredita vigencia de fuentes ni salud actual y nunca se usa como caché de resultados verdes.
+
+Soma reserva espacio en el archivo antes de retirar un resultado detallado. Si no puede leer o desalojar metadata, conserva la evidencia y devuelve `history_unavailable` al intentar nuevos envíos; las consultas al dueño pueden incluir `history_error`. La exportación tampoco omite silenciosamente registros ilegibles. Después de resolver el problema de almacenamiento, el próximo envío reintenta el mantenimiento. Los trabajos que ya estaban activos conservan sus participaciones.
+
+Cada trabajo activo usa un buffer de 64 KiB y hasta tres segmentos de 1 MiB. La cola admite 128 pedidos pendientes y cada trabajo 128 participaciones. Las 128 referencias intermedias más recientes se conservan; usá el ID canónico devuelto por Submit. Al volver a abrir después de una interrupción se registra `interrupted`, sin reejecutar automáticamente.
 
 Para permitir tests mientras una aplicación Java sigue activa, añadí `"snapshot": true` a su `run` de tipo `java_jar` únicamente si el JAR es autocontenido. Soma copia y verifica el JAR, conserva el CWD original y ejecuta esa copia hasta el próximo reinicio. No aísla archivos externos, bases de datos o puertos: elegí un entorno de pruebas adecuado. Los runtimes genéricos y JAR sin esta opción mantienen la exclusión del checkout. Los cambios de rama siguen bloqueados mientras corre una aplicación.
 

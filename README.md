@@ -73,13 +73,16 @@ Para leer sólo lo nuevo, pasá el `cursor` de una respuesta a `logs --after CUR
 
 ```powershell
 soma-cli jobs configs --path C:\repos\mi-app
+soma-cli jobs doctor --path C:\repos\mi-app --config tests
 soma-cli jobs submit --path C:\repos\mi-app --config tests --kind test -- test
-soma-cli jobs wait --job ID
+soma-cli jobs wait --job ID --summary
 ```
 
 Soma usa el Wrapper del proyecto y registra código de salida y evidencia de Surefire/Failsafe. Las solicitudes equivalentes pendientes o activas comparten el trabajo; cada solicitante recibe su `participant_id`. Para retirarte, usá `jobs release --job ID --participant ID`.
 
 Un timeout deja el trabajo activo. Un `jobs status` con `ok:true` confirma la consulta; `jobs wait` y su evidencia indican si la validación pasó. La configuración JVM de la aplicación se mantiene separada de Maven y de los tests.
+
+`--summary` muestra un veredicto compacto con checkout, selección y conteos. `jobs list --path DIRECTORIO --summary` filtra los trabajos; `jobs logs --job ID --after CURSOR` continúa una lectura sin repetir el historial. Al retirarse los 100 resultados detallados, la metadata se archiva con límites de cantidad, edad y tamaño. Los comandos y la creación segura de configuraciones de tests se explican en [la referencia](CLI.md#trabajos-maven-independientes).
 
 ## Configuración y actualizaciones
 

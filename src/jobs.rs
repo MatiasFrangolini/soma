@@ -17,7 +17,9 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-const HISTORY: usize = 100;
+pub(crate) const HISTORY: usize = 100;
+pub(crate) const PENDING: usize = 128;
+pub(crate) const JSON_LIMIT: usize = 256 * 1024;
 const LOG_BUDGET: u64 = 30 * 1024 * 1024;
 const ACTIVE_LOG_BUDGET: u64 = 3 * 1024 * 1024;
 const PARTICIPANTS: usize = 128;
@@ -59,15 +61,15 @@ fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T> {
     use std::io::Read;
     let file = fs::File::open(path).map_err(|_| "Archivo de trabajo no encontrado")?;
     let mut bytes = Vec::new();
-    file.take(128 * 1024 + 1)
+    file.take(JSON_LIMIT as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
-    if bytes.len() > 128 * 1024 {
+    if bytes.len() > JSON_LIMIT {
         return Err("Archivo de trabajo demasiado grande".into());
     }
     serde_json::from_slice(&bytes).map_err(|_| "Archivo de trabajo inválido".into())
 }
-fn valid_id(id: &str) -> bool {
+pub(crate) fn valid_id(id: &str) -> bool {
     id.starts_with("job-")
         && id.len() <= 64
         && id
@@ -89,6 +91,18 @@ pub struct Timings {
     pub maven_ms: Option<u64>,
     pub evidence_ms: Option<u64>,
     pub total_ms: Option<u64>,
+    pub preparation: Option<PlanTimings>,
+    pub pre_execution: Option<PlanTimings>,
+    pub final_verification: Option<PlanTimings>,
+    pub report_collection_ms: Option<u64>,
+}
+#[derive(Clone, Default, Serialize, Deserialize)]
+pub struct PlanTimings {
+    pub reactor_ms: u64,
+    pub configuration_ms: u64,
+    pub environment_ms: u64,
+    pub adapter_ms: u64,
+    pub fingerprint: model::FingerprintTimings,
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Record {
@@ -133,6 +147,7 @@ struct Plan {
     adapter: Option<CommandSpec>,
     adapter_digest: String,
     key: String,
+    observed: PlanTimings,
 }
 #[derive(Serialize, Deserialize)]
 pub struct MavenRequest {
@@ -163,6 +178,7 @@ struct State {
     ready: VecDeque<String>,
     active_checkouts: BTreeSet<PathBuf>,
     closing: bool,
+    history_error: Option<String>,
 }
 pub struct Jobs {
     store: Store,
@@ -183,6 +199,7 @@ fn safe_args(args: &[String]) -> Vec<String> {
             if property {
                 property = false;
                 let key = a.split_once('=').map(|(k, _)| k).unwrap_or(a);
+                if matches!(key, "test" | "it.test") { return a.clone(); }
                 return format!("{key}=<redacted>");
             }
             if matches!(a.as_str(), "-D" | "--define") {
@@ -294,6 +311,7 @@ fn validate_reactor(directory: &Path) -> Result<Vec<PathBuf>> {
         .collect())
 }
 fn plan(store: &Store, request: &Request) -> Result<Plan> {
+    let mut observed = PlanTimings::default();
     if !matches!(request.kind.as_str(), "test" | "build") {
         return Err("kind debe ser test o build".into());
     }
@@ -325,39 +343,19 @@ fn plan(store: &Store, request: &Request) -> Result<Plan> {
             "Esta entrega ejecuta el pom.xml del checkout elegido; no admite -f/--file".into(),
         );
     }
+    let clock = Instant::now();
     let modules = validate_reactor(&directory)?;
-    let project_id = store.project_at(&directory)?;
-    let settings = store.load()?;
-    let mut project = settings
-        .projects
-        .into_iter()
-        .find(|p| p.id == project_id)
-        .ok_or("Proyecto no encontrado")?;
-    let test = project
-        .test_configs
-        .iter()
-        .find(|c| c.id == request.config)
-        .ok_or("Configuración de pruebas no encontrada; agregala en test_configs")?;
-    let mut config = test.context();
-    let rebase = |value: &mut String| {
-        if let Ok(relative) = Path::new(value).strip_prefix(&project.directory) {
-            *value = directory.join(relative).to_string_lossy().into();
-        }
-    };
-    if let Some(value) = &mut config.env_file {
-        rebase(value);
-    }
-    if let Some(value) = &mut config.jdk {
-        rebase(value);
-    }
-    for value in &mut config.inputs {
-        rebase(value);
-    }
-    project.directory = directory;
+    observed.reactor_ms = ms(clock);
+    let clock = Instant::now();
+    let (settings, project, test) = store.test_target(&directory, &request.config)?;
+    let config = test.context();
+    observed.configuration_ms = ms(clock);
     if !project.directory.join("pom.xml").is_file() {
         return Err("El checkout no contiene pom.xml".into());
     }
+    let clock = Instant::now();
     let environment = model::environment(&project, &config)?;
+    observed.environment_ms = ms(clock);
     let wrapper = if project.directory.join("mvnw.cmd").is_file() {
         project.directory.join("mvnw.cmd").to_string_lossy().into()
     } else {
@@ -373,14 +371,19 @@ fn plan(store: &Store, request: &Request) -> Result<Plan> {
     } else {
         request.args.clone()
     };
+    let clock = Instant::now();
     let adapter_digest = adapter_digest(&settings.job_adapter)?;
+    let wrapper_digest = if Path::new(&wrapper).is_file() { Some(model::hash_file(Path::new(&wrapper))?) } else { None };
+    observed.adapter_ms = ms(clock);
     let mut digest = Sha256::new();
-    digest.update(model::fingerprint(&project, &config, &environment)?);
+    let (fingerprint, timings) = model::fingerprint_observed(&project, &config, &environment)?;
+    observed.fingerprint = timings;
+    digest.update(fingerprint);
     digest.update(&request.kind);
     digest.update(serde_json::to_vec(&args).map_err(|e| e.to_string())?);
     digest.update(&adapter_digest);
-    if Path::new(&wrapper).is_file() {
-        digest.update(model::hash_file(Path::new(&wrapper))?);
+    if let Some(digest_value) = wrapper_digest {
+        digest.update(digest_value);
     }
     Ok(Plan {
         project,
@@ -391,6 +394,7 @@ fn plan(store: &Store, request: &Request) -> Result<Plan> {
         adapter: settings.job_adapter,
         adapter_digest,
         key: format!("{:x}", digest.finalize()),
+        observed,
     })
 }
 impl Jobs {
@@ -403,6 +407,7 @@ impl Jobs {
             ready: VecDeque::new(),
             active_checkouts: BTreeSet::new(),
             closing: false,
+            history_error: crate::job_history::Archive::open(&store).and_then(|mut history| history.prune()).err(),
         };
         for directory in fs::read_dir(store.home.join("jobs"))
             .map_err(|e| e.to_string())?
@@ -512,12 +517,19 @@ impl Jobs {
             return crate::error("Soma se está cerrando");
         }
         self.prune(&mut state, LOG_BUDGET);
+        if let Some(error) = &state.history_error {
+            return json!({"ok":false,"code":"history_unavailable","error":error,"next_action":"repair_history_storage"});
+        }
+        if state.entries.values().filter(|e| terminal(&e.record.state) && e.record.canonical_job_id.is_none()).count() > HISTORY
+            || state.entries.values().filter(|e| e.record.canonical_job_id.is_some()).count() > ALIASES {
+            return crate::error("No se pudo archivar el historial; revisá el almacenamiento antes de enviar otro trabajo");
+        }
         if state
             .entries
             .values()
             .filter(|e| !terminal(&e.record.state))
             .count()
-            >= 128
+            >= PENDING
         {
             return crate::error("La cola alcanzó su límite de 128 trabajos pendientes");
         }
@@ -581,10 +593,12 @@ impl Jobs {
     pub fn status(&self, id: &str) -> Value {
         let state = self.state.lock().unwrap();
         let Some(canonical) = Self::resolve(&state, id) else {
-            return crate::error("Trabajo no encontrado o vencido");
+            drop(state);
+            return Self::offline(&self.store, id, None);
         };
         let Some(entry) = state.entries.get(&canonical) else {
-            return crate::error("El trabajo compartido venció");
+            drop(state);
+            return Self::offline(&self.store, id, None);
         };
         let wait_reason = match entry.record.state.as_str() {
             "queued" if state.active_checkouts.contains(&entry.record.directory) => Some("checkout_in_use"),
@@ -594,21 +608,26 @@ impl Jobs {
             _ => None,
         };
         json!({"ok":true,"job_id":canonical,"requested_job_id":id,"job":entry.record,"wait_reason":wait_reason,
-            "participants":entry.participants.len(),"worker_pid":entry.runner.as_ref().and_then(|r|r.status().worker_pid)})
+            "history_error":state.history_error,"participants":entry.participants.len(),"worker_pid":entry.runner.as_ref().and_then(|r|r.status().worker_pid)})
     }
-    pub fn list(&self) -> Value {
+    pub fn list(&self, summary: bool) -> Value {
         let state = self.state.lock().unwrap();
         let records = state
             .entries
             .values()
             .filter(|e| e.record.canonical_job_id.is_none())
             .map(|e| {
-                json!({"job_id":e.record.job_id,"state":e.record.state,"kind":e.record.kind,
+                if summary {
+                    let mut value = crate::job_output::compact(&json!(e.record));
+                    value["participants"] = json!(e.participants.len());
+                    value["historical"] = json!(terminal(&e.record.state));
+                    value
+                } else { json!({"job_id":e.record.job_id,"state":e.record.state,"kind":e.record.kind,
                 "project":e.record.project,"directory":e.record.directory,"config":e.record.config,
-                "created_at_ms":e.record.created_at_ms,"participants":e.participants.len()})
+                "created_at_ms":e.record.created_at_ms,"participants":e.participants.len()}) }
             })
             .collect::<Vec<_>>();
-        json!({"ok":true,"jobs":records,"concurrency":self.concurrency,"retained_limit":HISTORY,"log_budget_bytes":LOG_BUDGET})
+        json!({"ok":true,"jobs":records,"concurrency":self.concurrency,"retained_limit":HISTORY,"log_budget_bytes":LOG_BUDGET,"history_error":state.history_error})
     }
     pub fn release(&self, id: &str, participant: &str) -> Value {
         let mut state = self.state.lock().unwrap();
@@ -751,6 +770,7 @@ impl Jobs {
                                 entry.record.state = "joined".into();
                                 entry.record.finished_at_ms = Some(utc_ms());
                                 entry.record.timings.preparation_ms = Some(ms(clock));
+                                entry.record.timings.preparation = Some(plan.observed.clone());
                                 entry.request = None;
                             });
                         } else {
@@ -764,6 +784,7 @@ impl Jobs {
                                 entry.record.adapter_digest = Some(plan.adapter_digest.clone());
                                 entry.record.requested_maven_args = safe_args(&plan.args);
                                 entry.record.timings.preparation_ms = Some(ms(clock));
+                                entry.record.timings.preparation = Some(plan.observed.clone());
                                 entry.prepared = Some(Instant::now());
                                 entry.plan = Some(plan);
                             });
@@ -871,7 +892,12 @@ impl Jobs {
                 Err(error) => return Err(error),
             }
         };
-        if crate::jobs::plan(&self.store, request)?.key != plan.key {
+        let verified = crate::jobs::plan(&self.store, request)?;
+        {
+            let mut state = self.state.lock().unwrap();
+            self.update(&mut state, id, |entry| entry.record.timings.pre_execution = Some(verified.observed));
+        }
+        if verified.key != plan.key {
             return Err("invalidated: las entradas cambiaron mientras el trabajo esperaba".into());
         }
         let directory = self.directory(id);
@@ -970,13 +996,15 @@ impl Jobs {
                 detail.message.truncate(end);
             }
         }
-        let changed = crate::jobs::plan(&self.store, request)
-            .map(|p| p.key != plan.key)
-            .unwrap_or(true);
+        let collection_ms = ms(clock);
+        let verified = crate::jobs::plan(&self.store, request);
+        let changed = verified.as_ref().map(|p| p.key != plan.key).unwrap_or(true);
         {
             let mut state = self.state.lock().unwrap();
             self.update(&mut state, id, |entry| {
                 entry.record.timings.evidence_ms = Some(ms(clock));
+                entry.record.timings.report_collection_ms = Some(collection_ms);
+                entry.record.timings.final_verification = verified.ok().map(|p| p.observed);
             });
         }
         Ok((code, evidence, changed))
@@ -1004,15 +1032,12 @@ impl Jobs {
         });
         json!({"ok":true})
     }
-    pub fn logs(&self, id: &str, tail: usize) -> Value {
-        let state = self.state.lock().unwrap();
-        let Some(canonical) = Self::resolve(&state, id) else {
-            return crate::error("Trabajo no encontrado");
-        };
-        drop(state);
-        disk_logs(&self.directory(&canonical), tail)
+    pub fn logs(&self, id: &str, request: &Value) -> Value {
+        let response = self.status(id);
+        job_logs(&self.store, response, request)
     }
     fn prune(&self, state: &mut State, log_budget: u64) {
+        let retry_history = state.history_error.take().is_some();
         let mut aliases = state
             .entries
             .iter()
@@ -1020,7 +1045,19 @@ impl Jobs {
             .map(|(id, e)| (e.record.created_at_ms, id.clone()))
             .collect::<Vec<_>>();
         aliases.sort();
+        let needs_history = retry_history || aliases.len() > ALIASES
+            || state.entries.values().filter(|e| terminal(&e.record.state) && e.record.canonical_job_id.is_none()).count() > HISTORY;
+        let mut history = if needs_history {
+            match crate::job_history::Archive::open(&self.store).and_then(|mut history| { history.prune()?; Ok(history) }) {
+                Ok(history) => Some(history),
+                Err(error) => { state.history_error = Some(error); None }
+            }
+        } else { None };
         for (_, id) in aliases.iter().take(aliases.len().saturating_sub(ALIASES)) {
+            let Some(history) = history.as_mut() else { break; };
+            if let Some(entry) = state.entries.get(id) {
+                if let Err(error) = history.retain(&entry.record) { state.history_error = Some(error); break; }
+            }
             state.entries.remove(id);
             self.remove_files(id, true);
         }
@@ -1032,6 +1069,8 @@ impl Jobs {
             .collect::<Vec<_>>();
         finished.sort();
         for (_, id) in finished.iter().take(finished.len().saturating_sub(HISTORY)) {
+            if state.history_error.is_some() { break; }
+            let Some(history) = history.as_mut() else { break; };
             let aliases = state
                 .entries
                 .iter()
@@ -1039,6 +1078,9 @@ impl Jobs {
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
             for alias in aliases.into_iter().chain(std::iter::once(id.clone())) {
+                if let Some(entry) = state.entries.get(&alias) {
+                    if let Err(error) = history.retain(&entry.record) { state.history_error = Some(error); break; }
+                }
                 state.entries.remove(&alias);
                 self.remove_files(&alias, true);
             }
@@ -1085,6 +1127,10 @@ impl Jobs {
             for name in ["result.json", "result.json.tmp", "request.json"] {
                 let _ = fs::remove_file(directory.join(name));
             }
+            for name in ["observations.json", "observations.tmp", "rotation.pending"] {
+                let _ = fs::remove_file(directory.join("logs").join(name));
+            }
+            let _ = fs::remove_dir(directory.join("logs"));
             let _ = fs::remove_dir(directory);
         }
     }
@@ -1093,7 +1139,9 @@ impl Jobs {
             return crate::error("ID de trabajo inválido");
         }
         let read = |id: &str| -> Result<Record> {
-            read_json(&store.home.join("jobs").join(id).join("result.json"))
+            read_json::<Record>(&store.home.join("jobs").join(id).join("result.json"))
+                .or_else(|_| crate::job_history::read(store, id))
+                .and_then(|record| if record.job_id == id { Ok(record) } else { Err("Identidad de trabajo inválida".into()) })
         };
         let mut record = match read(id) {
             Ok(r) => r,
@@ -1109,10 +1157,14 @@ impl Jobs {
             };
         }
         if let Some(tail) = tail {
-            return disk_logs(&store.home.join("jobs").join(&record.job_id), tail);
+            return job_logs(store, Self::offline(store, &record.job_id, None), &json!({"tail":tail}));
         }
         let owner_unavailable = !terminal(&record.state);
-        json!({"ok":true,"job_id":record.job_id,"job":record,"owner_unavailable":owner_unavailable})
+        let archived = !store.home.join("jobs").join(&record.job_id).join("result.json").is_file();
+        let logs_retained = ["current.log", "previous-1.log", "previous-2.log"].iter()
+            .any(|name| store.home.join("jobs").join(&record.job_id).join("logs").join(name).is_file());
+        json!({"ok":true,"job_id":record.job_id,"job":record,"owner_unavailable":owner_unavailable,
+            "archived":archived,"historical":true,"details_retained":!archived,"logs_retained":logs_retained})
     }
     pub fn offline_list(store: &Store) -> Value {
         let mut records = Vec::new();
@@ -1127,13 +1179,20 @@ impl Jobs {
                     && value["job"]["canonical_job_id"].is_null()
                     && value["job_id"] == id
                 {
-                    records.push(value["job"].clone());
+                    let mut record = value["job"].clone();
+                    for key in ["archived", "historical", "details_retained", "logs_retained"] {
+                        record[key] = value[key].clone();
+                    }
+                    records.push(record);
                 }
             }
         }
         let concurrency = store.load().map(|settings| settings.job_concurrency).unwrap_or(1);
         json!({"ok":true,"jobs":records,"owner_unavailable":true,"concurrency":concurrency,
             "retained_limit":HISTORY,"log_budget_bytes":LOG_BUDGET})
+    }
+    pub fn offline_logs(store: &Store, id: &str, request: &Value) -> Value {
+        job_logs(store, Self::offline(store, id, None), request)
     }
 }
 fn log_size(directory: &Path) -> u64 {
@@ -1143,24 +1202,28 @@ fn log_size(directory: &Path) -> u64 {
         .map(|m| m.len())
         .sum()
 }
-fn disk_logs(directory: &Path, tail: usize) -> Value {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut bytes = Vec::new();
-    for name in ["previous-2.log", "previous-1.log", "current.log"] {
-        let Ok(mut file) = fs::File::open(directory.join("logs").join(name)) else {
-            continue;
-        };
-        let length = file.metadata().map(|m| m.len()).unwrap_or(0);
-        let _ = file.seek(SeekFrom::Start(length.saturating_sub(512 * 1024)));
-        let _ = file.take(512 * 1024).read_to_end(&mut bytes);
-        if bytes.len() > 512 * 1024 {
-            bytes.drain(..bytes.len() - 512 * 1024);
-        }
+fn job_logs(store: &Store, response: Value, request: &Value) -> Value {
+    if response["ok"] != true { return response; }
+    let id = response["job_id"].as_str().unwrap_or("");
+    if !valid_id(id) { return crate::error("ID de trabajo inválido"); }
+    let directory = store.home.join("jobs").join(id).join("logs");
+    let finished = terminal(response["job"]["state"].as_str().unwrap_or(""));
+    let has_logs = ["current.log", "previous-1.log", "previous-2.log"].iter().any(|name| directory.join(name).is_file());
+    if response["archived"] == true || (finished && !has_logs) {
+        return json!({"ok":false,"code":"job_logs_unavailable","job_id":id,
+            "error":"Los logs ya no están retenidos; la metadata del resultado sigue disponible",
+            "next_action":"inspect_job_result"});
     }
-    let text = String::from_utf8_lossy(&bytes);
-    let mut lines = text.lines().rev().take(tail.min(2000)).collect::<Vec<_>>();
-    lines.reverse();
-    json!({"ok":true,"text":lines.join("\n"),"directory":directory.join("logs"),"source":"disk"})
+    let mut scoped = request.clone();
+    scoped["operation"] = Value::Null;
+    if scoped["after"].is_null() {
+        scoped["tail"] = json!(request["tail"].as_u64().unwrap_or(200).min(2000));
+    }
+    let mut value = crate::observation::logs(&directory, &scoped, None);
+    value["job_id"] = json!(id);
+    value["attribution"] = json!("job");
+    value["historical"] = json!(finished || response["owner_unavailable"] == true);
+    value
 }
 pub fn maven_child() -> i32 {
     unsafe extern "system" fn control(event: u32) -> i32 {

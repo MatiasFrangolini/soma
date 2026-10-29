@@ -196,9 +196,9 @@ fn dispatch(engine: &Arc<Engine>, jobs: &Arc<crate::jobs::Jobs>, r: &Value) -> V
             Err(_) => crate::error("Solicitud de trabajo inválida"),
         },
         "job_status" => jobs.status(r["job"].as_str().unwrap_or("")),
-        "job_list" => jobs.list(),
+        "job_list" => jobs.list(r["summary"] == true),
         "job_release" => jobs.release(r["job"].as_str().unwrap_or(""), r["participant"].as_str().unwrap_or("")),
-        "job_logs" => jobs.logs(r["job"].as_str().unwrap_or(""), r["tail"].as_u64().unwrap_or(200).min(2000) as usize),
+        "job_logs" => jobs.logs(r["job"].as_str().unwrap_or(""), r),
         "job_started" => jobs.started(r["job"].as_str().unwrap_or(""), r["token"].as_str().unwrap_or(""),
             serde_json::from_value(r["args"].clone()).unwrap_or_default()),
         "status" => {

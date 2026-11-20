@@ -44,7 +44,7 @@ fn entry_names(path: &Path) -> Option<(String, String)> {
 struct Entry {
     path: PathBuf,
     inputs: Vec<String>,
-    input_names: Vec<(String, String)>,
+    input_names: Vec<(String, Option<(String, String)>)>,
     excludes: Vec<String>,
     root: File,
     watch: Mutex<Option<Watch>>,
@@ -53,7 +53,12 @@ struct Entry {
 impl Entry {
     fn new(p: &Project, c: &Config) -> Option<Self> {
         // Restrict the index to direct local roots. Other layouts use a full walk.
-        if c.inputs.iter().any(|s| {
+        let active: Vec<_> = c
+            .inputs
+            .iter()
+            .filter(|s| !crate::model::ignored(&crate::model::resolve(p, s), c, &p.directory))
+            .collect();
+        if active.iter().any(|s| {
             let mut parts = Path::new(s).components();
             !matches!(parts.next(), Some(Component::Normal(name)) if name == s.as_str())
                 || parts.next().is_some()
@@ -96,11 +101,10 @@ impl Entry {
             return None;
         }
         let watch = Watch::new(root.try_clone().ok()?)?;
-        let input_names = c
-            .inputs
-            .iter()
-            .map(|s| entry_names(&p.directory.join(s)))
-            .collect::<Option<Vec<_>>>()?;
+        let input_names = active
+            .into_iter()
+            .map(|s| (s.clone(), entry_names(&p.directory.join(s))))
+            .collect();
         Some(Self {
             path: p.directory.clone(),
             inputs: c.inputs.clone(),
@@ -128,7 +132,10 @@ impl Entry {
         // Short names and non-ASCII case folding can alias configured inputs.
         if name.contains('~')
             || !name.is_ascii()
-            || self.inputs.iter().any(|s| !s.is_ascii() || s.contains('~'))
+            || self
+                .input_names
+                .iter()
+                .any(|(s, _)| !s.is_ascii() || s.contains('~'))
         {
             return true;
         }
@@ -138,47 +145,44 @@ impl Entry {
             return true;
         };
         let tail = parts.as_path();
-        self.inputs
-            .iter()
-            .zip(&self.input_names)
-            .any(|(configured, (long, short))| {
-                if !long.is_ascii()
-                    || !short.is_ascii()
-                    || first.eq_ignore_ascii_case(short.as_str())
-                {
+        self.input_names.iter().any(|(configured, names)| {
+            let Some((long, short)) = names else {
+                return true;
+            };
+            if !long.is_ascii() || !short.is_ascii() || first.eq_ignore_ascii_case(short.as_str()) {
+                return true;
+            }
+            if !first.eq_ignore_ascii_case(long.as_str()) {
+                return false;
+            }
+            // The walk starts with the configured spelling, even on a
+            // case-insensitive volume. Its children use on-disk long names.
+            let start = Path::new(configured);
+            if crate::model::ignored_relative(start, &self.excludes) {
+                return false;
+            }
+            if tail.as_os_str().is_empty() {
+                return true;
+            }
+            if !start
+                .join(tail)
+                .ancestors()
+                .any(|p| crate::model::ignored_relative(p, &self.excludes))
+            {
+                return true;
+            }
+            let mut walked = start.to_owned();
+            for part in tail.iter() {
+                let Some((long, _)) = entry_names(&self.path.join(&walked).join(part)) else {
                     return true;
-                }
-                if !first.eq_ignore_ascii_case(long.as_str()) {
+                };
+                walked.push(long);
+                if crate::model::ignored_relative(&walked, &self.excludes) {
                     return false;
                 }
-                // The walk starts with the configured spelling, even on a
-                // case-insensitive volume. Its children use on-disk long names.
-                let start = Path::new(configured);
-                if crate::model::ignored_relative(start, &self.excludes) {
-                    return false;
-                }
-                if tail.as_os_str().is_empty() {
-                    return true;
-                }
-                if !start
-                    .join(tail)
-                    .ancestors()
-                    .any(|p| crate::model::ignored_relative(p, &self.excludes))
-                {
-                    return true;
-                }
-                let mut walked = start.to_owned();
-                for part in tail.iter() {
-                    let Some((long, _)) = entry_names(&self.path.join(&walked).join(part)) else {
-                        return true;
-                    };
-                    walked.push(long);
-                    if crate::model::ignored_relative(&walked, &self.excludes) {
-                        return false;
-                    }
-                }
-                true
-            })
+            }
+            true
+        })
     }
 }
 
@@ -211,7 +215,7 @@ impl Inventory {
         &self,
         p: &Project,
         c: &Config,
-        scan: impl FnOnce() -> Result<(Vec<PathBuf>, bool)>,
+        scan: impl FnOnce() -> crate::model::ScanResult,
     ) -> Result<Selection> {
         {
             let mut cache = self.0.lock().unwrap();
@@ -229,17 +233,20 @@ impl Inventory {
                 cache.remove(index);
             }
         }
-        self.scan(p, c, scan)
+        self.scan(p, c, false, scan)
     }
 
     pub fn scan(
         &self,
         p: &Project,
         c: &Config,
-        scan: impl FnOnce() -> Result<(Vec<PathBuf>, bool)>,
+        previous_change: bool,
+        scan: impl FnOnce() -> crate::model::ScanResult,
     ) -> Result<Selection> {
         let entry = Entry::new(p, c);
-        let (files, cacheable) = scan()?;
+        let (files, cacheable) = scan().map_err(|error| {
+            error.explain(previous_change || entry.as_ref().is_some_and(|entry| !entry.current()))
+        })?;
         let files = Arc::new(files);
         let witness = entry.filter(|_| cacheable).map(|mut entry| {
             entry.files = files.clone();

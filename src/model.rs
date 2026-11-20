@@ -731,7 +731,7 @@ pub fn branch(dir: &Path) -> String {
     }
     "Sin Git / no disponible".into()
 }
-fn ignored(path: &Path, c: &Config, root: &Path) -> bool {
+pub(crate) fn ignored(path: &Path, c: &Config, root: &Path) -> bool {
     ignored_relative(path.strip_prefix(root).unwrap_or(path), &c.input_excludes)
 }
 pub(crate) fn ignored_relative(path: &Path, excludes: &[String]) -> bool {
@@ -769,21 +769,40 @@ pub(crate) fn ignored_relative(path: &Path, excludes: &[String]) -> bool {
         })
         .unwrap_or(false)
 }
-fn walk(path: &Path, metadata: Option<fs::Metadata>, c: &Config, root: &Path, files: &mut Vec<PathBuf>, cacheable: &mut bool) -> Result<()> {
-    if ignored(path, c, root) {
+pub(crate) enum ScanError {
+    InitialLookup(std::io::Error),
+    ObservedEntry(std::io::Error),
+}
+impl ScanError {
+    pub(crate) fn explain(self, changed: bool) -> String {
+        let (observed, error) = match self {
+            Self::InitialLookup(error) => (changed, error),
+            Self::ObservedEntry(error) => (true, error),
+        };
+        if observed && matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) {
+            format!("invalidated: desapareció una entrada durante la enumeración: {error}")
+        } else { error.to_string() }
+    }
+}
+pub(crate) type ScanResult = std::result::Result<(Vec<PathBuf>, bool), ScanError>;
+fn walk(path: &Path, metadata: Option<fs::Metadata>, c: &Config, root: &Path, files: &mut Vec<PathBuf>, cacheable: &mut bool) -> std::result::Result<(), ScanError> {
+    if metadata.is_none() && ignored(path, c, root) {
         return Ok(());
     }
     use std::os::windows::fs::MetadataExt;
-    let meta = match metadata { Some(meta) => meta, None => fs::symlink_metadata(path).map_err(|e| e.to_string())? };
+    let meta = match metadata { Some(meta) => meta, None => fs::symlink_metadata(path).map_err(ScanError::InitialLookup)? };
     if meta.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 { *cacheable = false; }
     let kind = meta.file_type();
     if kind.is_symlink() {
-        return Err(format!("Entrada symlink no soportada: {}", path.display()));
+        return Err(ScanError::ObservedEntry(std::io::Error::other(format!("Entrada symlink no soportada: {}", path.display()))));
     }
     if kind.is_dir() {
-        for item in fs::read_dir(path).map_err(|e| e.to_string())? {
-            let item = item.map_err(|e| e.to_string())?;
-            walk(&item.path(), Some(item.metadata().map_err(|e| e.to_string())?), c, root, files, cacheable)?;
+        for item in fs::read_dir(path).map_err(ScanError::ObservedEntry)? {
+            let item = item.map_err(ScanError::ObservedEntry)?;
+            let child = item.path();
+            if !ignored(&child, c, root) {
+                walk(&child, Some(item.metadata().map_err(ScanError::ObservedEntry)?), c, root, files, cacheable)?;
+            }
         }
     } else if kind.is_file() {
         files.push(path.to_path_buf());
@@ -835,7 +854,7 @@ pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<Strin
     };
     let mut files = match inventory {
         Some(index) => index.files(p, c, scan)?,
-        None => crate::inventory::Selection::uncached(scan()?.0),
+        None => crate::inventory::Selection::uncached(scan().map_err(|e| e.explain(false))?.0),
     };
     let mut observed = FingerprintTimings { inventory_hit: files.hit, scan_ms: clock.elapsed().as_millis() as u64, files: files.names.len(), ..Default::default() };
     let mut h = Sha256::new();
@@ -887,7 +906,7 @@ pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<Strin
         }
         if let Some(index) = inventory.filter(|_| attempt == 0) {
             let clock = std::time::Instant::now();
-            let fresh = index.scan(p, c, scan)?;
+            let fresh = index.scan(p, c, true, scan)?;
             observed.scan_ms += clock.elapsed().as_millis() as u64;
             if fresh.names == files.names && fresh.observed() {
                 files = fresh;

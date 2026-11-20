@@ -147,6 +147,7 @@ impl Archive {
         archive
             .entries
             .sort_by(|a, b| a.finished.cmp(&b.finished).then_with(|| a.id.cmp(&b.id)));
+        archive.reserve(LIMIT, BYTES)?;
         Ok(archive)
     }
     fn reserve(&mut self, count: usize, bytes: u64) -> Result<()> {
@@ -168,9 +169,6 @@ impl Archive {
             self.entries.remove(0);
         }
         Ok(())
-    }
-    pub(crate) fn prune(&mut self) -> Result<()> {
-        self.reserve(LIMIT, BYTES)
     }
 
     pub(crate) fn retain(&mut self, record: &Record) -> Result<()> {

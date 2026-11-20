@@ -204,7 +204,7 @@ fn dispatch(engine: &Arc<Engine>, jobs: &Arc<crate::jobs::Jobs>, r: &Value) -> V
             if r["summary"] == true && result["job"].is_object()
                 && !(r["until"] == "finished" && result["owner_unavailable"] == true) {
                 let result = if r["until"] == "finished" {
-                    crate::jobs_cli::outcome(result)
+                    crate::job_output::outcome(result)
                 } else { result };
                 crate::job_output::summary(result)
             } else { result }

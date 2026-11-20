@@ -14,14 +14,14 @@ $projects=foreach($name in 'a','b','c'){
     Set-Content "$dir/mvnw.cmd" @'
 @echo off
 if exist fail.flag exit /b 1
-if not exist hold.flag exit /b 0
+if not exist "%SOMA_BENCH_HOLD%" exit /b 0
 :wait
 ping -n 2 127.0.0.1 >nul
-if exist hold.flag goto wait
+if exist "%SOMA_BENCH_HOLD%" goto wait
 exit /b 0
 '@
     $runtime=@{id='observer-probe';name='Observer probe';inputs=@('pom.xml');run=@{kind='command';executable='ping.exe';args=@('-n','60','127.0.0.1')}}
-    @{id=$name;name=$name;directory=$dir;configs=@($runtime);test_configs=@(@{id='tests';name='tests';env=@{};inputs=@('pom.xml','mvnw.cmd','inputs')})}
+    @{id=$name;name=$name;directory=$dir;configs=@($runtime);test_configs=@(@{id='tests';name='tests';env=@{SOMA_BENCH_HOLD=(Join-Path $Workspace "hold-$name.flag")};inputs=@('pom.xml','mvnw.cmd','inputs')})}
 }
 @{schema_version=1;job_concurrency=2;projects=@($projects)}|ConvertTo-Json -Depth 9|Set-Content "$env:SOMA_HOME/projects.json"
 function Call([string[]]$Argv){ (& $cli @Argv)|ConvertFrom-Json }
@@ -95,8 +95,14 @@ try {
     $receipt.blocked_rewrites_observed=$rewrites
     foreach($mutex in $locks){$mutex.ReleaseMutex();$mutex.Dispose()};$locks=@()
     foreach($job in @($blocked)+@($free)){if(!(Wait-Result $job).ok){throw 'Checkout failed after release'}}
+    if($Verify){
+        foreach($job in $blocked){
+            $timings=(Call @('jobs','status','--job',$job.job_id)).job.timings
+            if($timings.checkout_retry_wait_ms -le 0 -or $timings.checkout_wait_ms -ne 0){throw 'External lock wait was not attributed separately'}
+        }
+    }
     foreach($observers in 1,10){
-        $flag=Join-Path $Workspace 'c/hold.flag'
+        $flag=Join-Path $Workspace 'hold-c.flag'
         Set-Content $flag 'hold'
         $job=Submit c
         $same=Submit c
@@ -187,7 +193,7 @@ try {
         $inputs=Join-Path $dir inputs
         Set-Content "$inputs/original" 'one'
         foreach($mutation in 'add','rename','delete','same-size-and-time'){
-            $hold=Join-Path $dir hold.flag
+            $hold=Join-Path $Workspace 'hold-c.flag'
             Set-Content $hold 'hold'
             $active=Submit c
             $deadline=[DateTime]::UtcNow.AddSeconds(20)
@@ -209,6 +215,10 @@ try {
             }
             Remove-Item -LiteralPath $hold
             if((Wait-Result $active).verdict -ne 'invalidated'){throw "Input change escaped verification: $mutation"}
+            $detail=Call @('jobs','status','--job',$active.job_id)
+            $cached=$detail.job.timings.final_verification.fingerprint.inventory_hit
+            $ntfs=([IO.DriveInfo]::new([IO.Path]::GetPathRoot($dir))).DriveFormat -eq 'NTFS'
+            if($ntfs -and $cached -ne ($mutation -eq 'same-size-and-time')){throw "Unexpected inventory path for $mutation"}
         }
     }
 }finally{

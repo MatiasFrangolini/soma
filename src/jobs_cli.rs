@@ -90,17 +90,6 @@ fn status(store: &Store, id: &str) -> Value {
     call(store, &json!({"command":"job_status","job":id}), false)
         .unwrap_or_else(|e| if e.is_absent() { Jobs::offline(store, id, None) } else { e.response() })
 }
-pub(crate) fn outcome(response: Value) -> Value {
-    if response["ok"] != true {
-        return response;
-    }
-    let job = &response["job"];
-    let code = crate::job_output::result_code(job);
-    match code {
-        Some(code) => json!({"ok":false,"code":code,"job_id":response["job_id"],"job":job}),
-        None => response,
-    }
-}
 fn observe_until(store: &Store, id: &str, phase: &str, deadline: Instant, summary: bool) -> Value {
     let mut backoff = Duration::from_millis(100);
     loop {
@@ -137,7 +126,7 @@ fn wait(store: &Store, id: &str, timeout: u64, summary: bool) -> Value {
         response["job"]["state"].as_str(),
         Some("completed" | "failed" | "cancelled" | "invalidated" | "interrupted")
     ) {
-        return outcome(response);
+        return crate::job_output::outcome(response);
     }
     json!({"ok":false,"code":"timeout","job_id":response["job_id"],"error":"La espera terminó; la participación y el trabajo siguen activos","job":response["job"]})
 }

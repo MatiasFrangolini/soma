@@ -834,11 +834,11 @@ pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<Strin
         files.dedup();
         Ok((files, cacheable))
     };
-    let (files, inventory_hit) = match inventory {
+    let mut files = match inventory {
         Some(index) => index.files(p, c, scan)?,
-        None => (std::sync::Arc::new(scan()?.0), false),
+        None => crate::inventory::Selection::uncached(scan()?.0),
     };
-    let mut observed = FingerprintTimings { inventory_hit, scan_ms: clock.elapsed().as_millis() as u64, files: files.len(), ..Default::default() };
+    let mut observed = FingerprintTimings { inventory_hit: files.hit, scan_ms: clock.elapsed().as_millis() as u64, files: files.names.len(), ..Default::default() };
     let mut h = Sha256::new();
     h.update(p.directory.to_string_lossy().as_bytes());
     let mut build_config = c.clone();
@@ -846,35 +846,52 @@ pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<Strin
     h.update(serde_json::to_vec(&build_config).unwrap());
     // Build tools may interpolate any environment value. Persist only the digest.
     h.update(serde_json::to_vec(env).unwrap());
-    let clock = std::time::Instant::now();
-    let branch = branch(&p.directory);
-    h.update(&branch);
-    let mut head = None;
-    use std::os::windows::process::CommandExt;
-    if let Ok(o) = std::process::Command::new("git")
-        .args(["-C", &p.directory.to_string_lossy(), "rev-parse", "HEAD"])
-        .creation_flags(0x08000000)
-        .output()
-    {
-        if o.status.success() {
-            head = Some(String::from_utf8_lossy(&o.stdout).trim().to_owned());
-            h.update(o.stdout);
+    let prefix = h;
+    for attempt in 0..2 {
+        let mut h = prefix.clone();
+        let clock = std::time::Instant::now();
+        let branch = branch(&p.directory);
+        h.update(&branch);
+        let mut head = None;
+        use std::os::windows::process::CommandExt;
+        if let Ok(o) = std::process::Command::new("git")
+            .args(["-C", &p.directory.to_string_lossy(), "rev-parse", "HEAD"])
+            .creation_flags(0x08000000)
+            .output()
+        {
+            if o.status.success() {
+                head = Some(String::from_utf8_lossy(&o.stdout).trim().to_owned());
+                h.update(o.stdout);
+            }
         }
+        observed.git_ms += clock.elapsed().as_millis() as u64;
+        let clock = std::time::Instant::now();
+        let mut buffer = [0u8; 65536];
+        for path in files.names.iter() {
+            h.update(
+                path.strip_prefix(&p.directory)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+            h.update([0]);
+            observed.bytes += feed_file(path, &mut h, &mut buffer)?;
+            h.update([0]);
+        }
+        observed.hash_ms += clock.elapsed().as_millis() as u64;
+        if !files.changed() {
+            return Ok((format!("{:x}", h.finalize()), observed, branch, head));
+        }
+        if let Some(index) = inventory.filter(|_| attempt == 0) {
+            let clock = std::time::Instant::now();
+            let fresh = index.scan(p, c, scan)?;
+            observed.scan_ms += clock.elapsed().as_millis() as u64;
+            if fresh.names == files.names && fresh.observed() {
+                files = fresh;
+                continue;
+            }
+        }
+        break;
     }
-    observed.git_ms = clock.elapsed().as_millis() as u64;
-    let clock = std::time::Instant::now();
-    let mut buffer = [0u8; 65536];
-    for path in files.iter() {
-        h.update(
-            path.strip_prefix(&p.directory)
-                .unwrap_or(path)
-                .to_string_lossy()
-                .as_bytes(),
-        );
-        h.update([0]);
-        observed.bytes += feed_file(path, &mut h, &mut buffer)?;
-        h.update([0]);
-    }
-    observed.hash_ms = clock.elapsed().as_millis() as u64;
-    Ok((format!("{:x}", h.finalize()), observed, branch, head))
+    Err("invalidated: las entradas cambiaron durante la verificación".into())
 }

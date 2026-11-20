@@ -163,6 +163,25 @@ try{
     }
     Wait-Closed
     $archive=Join-Path $data 'job-history'
+    # One expired record, below both capacity limits, readable but locked against deletion.
+    $recoveryHome=Join-Path $Workspace 'retry-prune'
+    $recoveryArchive=New-Item -ItemType Directory (Join-Path $recoveryHome 'job-history') -Force
+    Copy-Item -LiteralPath $configurationPath -Destination (Join-Path $recoveryHome 'projects.json')
+    $expiredPath=Join-Path $recoveryArchive.FullName 'job-locked-expired.json'
+    Record 'job-locked-expired' 'completed' 'passed' 0 'test' ($stamp-31L*24*60*60*1000)|ConvertTo-Json -Depth 12|Set-Content $expiredPath
+    $submitArgs=@('jobs','submit','--data-dir',$recoveryHome,'--path',$fixture,'--kind','invalid','--','test')
+    try{
+        $handle=[IO.File]::Open($expiredPath,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite)
+        try{
+            foreach($attempt in 1..2){
+                $blocked=Invoke-Cli $submitArgs
+                Assert ($blocked.Value.code -eq 'history_unavailable' -and !$blocked.Value.job_id) "Expired metadata blocks admission while pruning fails (attempt $attempt)"
+            }
+        }finally{$handle.Dispose()}
+        $recovered=Invoke-Cli $submitArgs
+        Assert ($recovered.Value.job_id -and !(Test-Path -LiteralPath $expiredPath)) 'Retry prunes expired metadata and restores admission after unlock'
+        $null=Invoke-Cli @('jobs','wait','--data-dir',$recoveryHome,'--job',$recovered.Value.job_id,'--timeout','30')
+    }finally{$null=Invoke-Cli @('close','--data-dir',$recoveryHome)}
     # Transient archive read failures must not become destructive cleanup.
     $lockedId='job-locked-metadata'
     $lockedPath=Join-Path $archive "$lockedId.json"

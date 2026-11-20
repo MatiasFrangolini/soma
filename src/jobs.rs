@@ -87,6 +87,7 @@ pub struct Timings {
     pub preparation_ms: Option<u64>,
     pub worker_wait_ms: Option<u64>,
     pub checkout_wait_ms: Option<u64>,
+    pub checkout_retry_wait_ms: Option<u64>,
     pub verification_ms: Option<u64>,
     pub soma_queue_ms: Option<u64>,
     pub resource_wait_ms: Option<u64>,
@@ -176,6 +177,7 @@ struct Entry {
     accepted: Instant,
     checkout_elapsed: Duration,
     blocked_since: Option<Instant>,
+    external_since: Option<Instant>,
     retry_at: Option<Instant>,
     prepared: Option<Instant>,
     adapter_started: Option<Instant>,
@@ -210,7 +212,7 @@ impl State {
         for id in &self.ready {
             let Some(entry) = self.entries.get_mut(id) else { continue };
             let first_free = claimed.insert(entry.record.directory.clone());
-            if !first_free || entry.retry_at.is_some() {
+            if !first_free && entry.external_since.is_none() {
                 entry.blocked_since.get_or_insert(now);
             } else if let Some(start) = entry.blocked_since.take() {
                 entry.checkout_elapsed += now.duration_since(start);
@@ -448,7 +450,7 @@ impl Jobs {
     pub fn new(store: Store) -> Result<Arc<Self>> {
         let concurrency = store.load()?.job_concurrency;
         fs::create_dir_all(store.home.join("jobs")).map_err(|e| e.to_string())?;
-        let archive = crate::job_history::Archive::open(&store).and_then(|mut archive| { archive.prune()?; Ok(archive) });
+        let archive = crate::job_history::Archive::open(&store);
         let mut recovered = Vec::new();
         let mut residues = Vec::new();
         let mut state = State {
@@ -496,6 +498,7 @@ impl Jobs {
                     accepted: Instant::now(),
                     checkout_elapsed: Duration::ZERO,
                     blocked_since: None,
+                    external_since: None,
                     retry_at: None,
                     prepared: None,
                     adapter_started: None,
@@ -646,9 +649,10 @@ impl Jobs {
                 cancel: Arc::new(AtomicBool::new(false)),
                 accepted: Instant::now(),
                 checkout_elapsed: Duration::ZERO,
-                    blocked_since: None,
-                    retry_at: None,
-                    prepared: None,
+                blocked_since: None,
+                external_since: None,
+                retry_at: None,
+                prepared: None,
                 adapter_started: None,
                 maven_started: None,
                 event_token: identity("event"),
@@ -924,7 +928,10 @@ impl Jobs {
                     let lease = crate::git::CheckoutLease::acquire(&entry.record.directory);
                     if matches!(&lease, Err(e) if e.starts_with("checkout_busy:")) {
                         let first = entry.retry_at.is_none();
-                        let since = *entry.blocked_since.get_or_insert(now);
+                        if let Some(start) = entry.blocked_since.take() {
+                            entry.checkout_elapsed += now.duration_since(start);
+                        }
+                        let since = *entry.external_since.get_or_insert(now);
                         let delay = (now.duration_since(since) + Duration::from_millis(100)).min(Duration::from_secs(1));
                         entry.retry_at = Some(now + delay);
                         if first {
@@ -933,8 +940,10 @@ impl Jobs {
                         continue;
                     }
                     let checkout_ms = entry.checkout_elapsed.as_millis() as u64 + entry.blocked_since.map(ms).unwrap_or(0);
+                    let retry_ms = entry.external_since.map(ms).unwrap_or(0);
                     entry.record.timings.checkout_wait_ms = Some(checkout_ms);
-                    entry.record.timings.worker_wait_ms = entry.prepared.map(|at| ms(at).saturating_sub(checkout_ms));
+                    entry.record.timings.checkout_retry_wait_ms = Some(retry_ms);
+                    entry.record.timings.worker_wait_ms = entry.prepared.map(|at| ms(at).saturating_sub(checkout_ms + retry_ms));
                     let plan = entry.plan.take().expect("queued job has a plan");
                     let request = entry.request.clone().expect("queued job has a request");
                     let cancel = entry.cancel.clone();

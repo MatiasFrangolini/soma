@@ -78,7 +78,8 @@ impl Entry {
                 16,
             )
         } == 0
-            || String::from_utf16_lossy(&fs_name[..4]) != "NTFS" || fs_name[4] != 0
+            || String::from_utf16_lossy(&fs_name[..4]) != "NTFS"
+            || fs_name[4] != 0
         {
             return None;
         }
@@ -114,45 +115,87 @@ impl Entry {
 }
 
 #[derive(Default)]
-pub(crate) struct Inventory(Mutex<VecDeque<Entry>>);
+pub(crate) struct Inventory(Mutex<VecDeque<Arc<Entry>>>);
+
+pub(crate) struct Selection {
+    pub names: Arc<Vec<PathBuf>>,
+    pub hit: bool,
+    witness: Option<Arc<Entry>>,
+}
+impl Selection {
+    pub fn uncached(names: Vec<PathBuf>) -> Self {
+        Self {
+            names: Arc::new(names),
+            hit: false,
+            witness: None,
+        }
+    }
+    pub fn changed(&self) -> bool {
+        self.witness.as_ref().is_some_and(|w| !w.current())
+    }
+    pub fn observed(&self) -> bool {
+        self.witness.is_some()
+    }
+}
+
 impl Inventory {
     pub fn files(
         &self,
         p: &Project,
         c: &Config,
         scan: impl FnOnce() -> Result<(Vec<PathBuf>, bool)>,
-    ) -> Result<(Arc<Vec<PathBuf>>, bool)> {
+    ) -> Result<Selection> {
         {
             let mut cache = self.0.lock().unwrap();
             if let Some(index) = cache.iter().position(|e| {
                 e.path == p.directory && e.inputs == c.inputs && e.excludes == c.input_excludes
             }) {
                 if cache[index].current() {
-                    return Ok((cache[index].files.clone(), true));
+                    let entry = cache[index].clone();
+                    return Ok(Selection {
+                        names: entry.files.clone(),
+                        hit: true,
+                        witness: Some(entry),
+                    });
                 }
                 cache.remove(index);
             }
         }
+        self.scan(p, c, scan)
+    }
+
+    pub fn scan(
+        &self,
+        p: &Project,
+        c: &Config,
+        scan: impl FnOnce() -> Result<(Vec<PathBuf>, bool)>,
+    ) -> Result<Selection> {
         let entry = Entry::new(p, c);
         let (files, cacheable) = scan()?;
         let files = Arc::new(files);
-        if let Some(mut entry) = entry.filter(|e| {
-            cacheable
-                && e.current()
+        let witness = entry.filter(|_| cacheable).map(|mut entry| {
+            entry.files = files.clone();
+            Arc::new(entry)
+        });
+        if let Some(entry) = witness.as_ref().filter(|e| {
+            e.current()
                 && files
                     .iter()
                     .map(|p| p.as_os_str().len() + std::mem::size_of::<PathBuf>())
                     .sum::<usize>()
                     <= 2 * 1024 * 1024
         }) {
-            entry.files = files.clone();
             let mut cache = self.0.lock().unwrap();
             cache.retain(|other| other.path != entry.path);
             if cache.len() >= 4 {
                 cache.pop_front();
             }
-            cache.push_back(entry);
+            cache.push_back(entry.clone());
         }
-        Ok((files, false))
+        Ok(Selection {
+            names: files,
+            hit: false,
+            witness,
+        })
     }
 }

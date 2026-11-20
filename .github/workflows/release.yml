@@ -54,6 +54,9 @@ jobs:
       - name: IPC permission contracts
         shell: pwsh
         run: ./tests/ipc.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-ipc-qa')
+      - name: Agent coordination and fingerprint contracts
+        shell: pwsh
+        run: ./tests/agent-efficiency.ps1 -Verify -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-agent-qa')
       - name: CLI argument safety
         shell: pwsh
         run: ./tests/cli-arguments.ps1 -BinaryDirectory (Resolve-Path ./target/x86_64-pc-windows-gnu/release).Path -Workspace (Join-Path $env:RUNNER_TEMP 'soma-arguments-qa')

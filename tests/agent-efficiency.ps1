@@ -225,3 +225,4 @@ try {
     foreach($mutex in $locks){$mutex.ReleaseMutex();$mutex.Dispose()}
     $null=Call @('close')
 }
+if($Verify){& "$PSScriptRoot/fingerprint-phase.ps1" -BinaryDirectory $BinaryDirectory -Workspace (Join-Path $Workspace 'phases')}

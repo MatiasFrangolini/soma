@@ -732,13 +732,12 @@ pub fn branch(dir: &Path) -> String {
     "Sin Git / no disponible".into()
 }
 fn ignored(path: &Path, c: &Config, root: &Path) -> bool {
-    if !c.input_excludes.is_empty() {
-        let rel = path
-            .strip_prefix(root)
-            .unwrap_or(path)
-            .to_string_lossy()
-            .replace('\\', "/");
-        if c.input_excludes
+    ignored_relative(path.strip_prefix(root).unwrap_or(path), &c.input_excludes)
+}
+pub(crate) fn ignored_relative(path: &Path, excludes: &[String]) -> bool {
+    if !excludes.is_empty() {
+        let rel = path.to_string_lossy().replace('\\', "/");
+        if excludes
             .iter()
             .any(|x| rel == *x || rel.starts_with(&format!("{x}/")))
         {

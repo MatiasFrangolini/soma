@@ -1,5 +1,7 @@
 //! Cache only sorted names. Every verification still reads and hashes every byte.
+mod notifications;
 use crate::model::{Config, Project, Result};
+use notifications::Watch;
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
@@ -7,20 +9,7 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{Arc, Mutex},
 };
-use windows_sys::Win32::{
-    Foundation::{HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT},
-    Storage::FileSystem::*,
-    System::Threading::WaitForSingleObject,
-};
-
-struct Watch(isize);
-impl Drop for Watch {
-    fn drop(&mut self) {
-        unsafe {
-            FindCloseChangeNotification(self.0 as HANDLE);
-        }
-    }
-}
+use windows_sys::Win32::Storage::FileSystem::*;
 fn directory(path: &Path) -> Option<File> {
     OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES)
@@ -41,7 +30,7 @@ struct Entry {
     inputs: Vec<String>,
     excludes: Vec<String>,
     root: File,
-    watch: Watch,
+    watch: Mutex<Option<Watch>>,
     files: Arc<Vec<PathBuf>>,
 }
 impl Entry {
@@ -49,7 +38,9 @@ impl Entry {
         // Restrict the index to direct local roots. Other layouts use a full walk.
         if c.inputs.iter().any(|s| {
             let mut parts = Path::new(s).components();
-            !matches!(parts.next(), Some(Component::Normal(_))) || parts.next().is_some()
+            !matches!(parts.next(), Some(Component::Normal(name)) if name == s.as_str())
+                || parts.next().is_some()
+                || s.ends_with(['.', ' '])
         }) {
             return None;
         }
@@ -64,7 +55,11 @@ impl Entry {
         if unsafe { GetDriveTypeW(drive_root.as_ptr()) } != DRIVE_FIXED {
             return None;
         }
-        let root = directory(&p.directory)?;
+        let root = OpenOptions::new()
+            .access_mode(FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED)
+            .open(&p.directory)
+            .ok()?;
         let mut fs_name = [0u16; 16];
         if unsafe {
             GetVolumeInformationByHandleW(
@@ -83,34 +78,47 @@ impl Entry {
         {
             return None;
         }
-        let native = std::os::windows::ffi::OsStrExt::encode_wide(p.directory.as_os_str())
-            .chain(Some(0))
-            .collect::<Vec<_>>();
-        let handle = unsafe {
-            FindFirstChangeNotificationW(
-                native.as_ptr(),
-                1,
-                FILE_NOTIFY_CHANGE_FILE_NAME
-                    | FILE_NOTIFY_CHANGE_DIR_NAME
-                    | FILE_NOTIFY_CHANGE_ATTRIBUTES,
-            )
-        };
-        if handle == INVALID_HANDLE_VALUE {
-            return None;
-        }
+        let watch = Watch::new(root.try_clone().ok()?)?;
         Some(Self {
             path: p.directory.clone(),
             inputs: c.inputs.clone(),
             excludes: c.input_excludes.clone(),
             root,
-            watch: Watch(handle as isize),
+            watch: Mutex::new(Some(watch)),
             files: Arc::default(),
         })
     }
     fn current(&self) -> bool {
-        identity(&self.root)
+        let mut watch = self.watch.lock().unwrap();
+        let current = identity(&self.root)
             .is_some_and(|id| directory(&self.path).and_then(|f| identity(&f)) == Some(id))
-            && unsafe { WaitForSingleObject(self.watch.0 as HANDLE, 0) } == WAIT_TIMEOUT
+            && watch
+                .as_mut()
+                .is_some_and(|watch| watch.unchanged(|name| self.relevant(name)));
+        if !current {
+            *watch = None;
+        }
+        current
+    }
+
+    fn relevant(&self, name: &str) -> bool {
+        // Short names and non-ASCII case folding can alias configured inputs.
+        if name.contains('~')
+            || !name.is_ascii()
+            || self.inputs.iter().any(|s| !s.is_ascii() || s.contains('~'))
+        {
+            return true;
+        }
+        let path = Path::new(name);
+        let Some(Component::Normal(first)) = path.components().next() else {
+            return true;
+        };
+        self.inputs
+            .iter()
+            .any(|s| first.eq_ignore_ascii_case(s.as_str()))
+            && !path
+                .ancestors()
+                .any(|p| crate::model::ignored_relative(p, &self.excludes))
     }
 }
 

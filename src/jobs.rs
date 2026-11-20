@@ -815,7 +815,10 @@ impl Jobs {
                 self.finish(&id, "cancelled", None);
             } else {
                 match prepared {
-                    Err(error) => self.finish(&id, "failed", Some(error)),
+                    Err(error) => {
+                        let state = if error.starts_with("invalidated:") { "invalidated" } else { "failed" };
+                        self.finish(&id, state, Some(error));
+                    }
                     Ok(plan) => {
                         let mut state = self.state.lock().unwrap();
                         if state.closing || cancel.load(Ordering::SeqCst) {

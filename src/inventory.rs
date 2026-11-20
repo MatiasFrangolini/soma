@@ -138,9 +138,6 @@ impl Entry {
             return true;
         };
         let tail = parts.as_path();
-        if tail.as_os_str().is_empty() {
-            return true;
-        }
         self.inputs
             .iter()
             .zip(&self.input_names)
@@ -159,6 +156,9 @@ impl Entry {
                 let start = Path::new(configured);
                 if crate::model::ignored_relative(start, &self.excludes) {
                     return false;
+                }
+                if tail.as_os_str().is_empty() {
+                    return true;
                 }
                 if !start
                     .join(tail)

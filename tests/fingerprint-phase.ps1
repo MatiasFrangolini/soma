@@ -17,6 +17,8 @@ fn main() {
             if mode.trim() == "excluded" {
                 fs::create_dir_all(root.join("target")).unwrap();
                 fs::File::create_new(root.join("target").join(std::process::id().to_string())).unwrap();
+            } else if mode.trim() == "outside" {
+                fs::File::create_new(PathBuf::from(&args[2]).join(format!("scratch-{}", std::process::id()))).unwrap();
             } else if mode.trim() == "remove" {
                 let _ = fs::remove_file(root.join("original"));
             } else if mode.trim() == "case" {
@@ -38,7 +40,7 @@ $previousStore=$env:SOMA_HOME
 $previousArm=$env:SOMA_QA_ARM
 try{
     $env:PATH=$toolDir.FullName+';'+$env:PATH
-    foreach($case in 'preparation','final','excluded','remove','case'){
+    foreach($case in 'preparation','final','excluded','remove','case','outside'){
         $caseDir=Join-Path $Workspace $case
         $fixture=Join-Path $caseDir 'checkout'
         $env:SOMA_HOME=Join-Path $caseDir 'data'
@@ -61,6 +63,8 @@ try{
             $result=& $cli jobs wait --job $job.job_id --timeout 45 --summary|ConvertFrom-Json
             if($case -eq 'excluded'){
                 if($result.verdict -ne 'built' -or !(Get-ChildItem (Join-Path $fixture 'inputs/target') -File)){throw 'Excluded Maven output invalidated a build'}
+            }elseif($case -eq 'outside'){
+                if($result.verdict -ne 'built' -or !(Get-ChildItem $fixture -Filter 'scratch-*' -File)){throw 'Unconfigured top-level file invalidated a build'}
             }elseif($case -eq 'remove'){
                 if($result.verdict -ne 'invalidated' -or (Test-Path (Join-Path $fixture 'inputs/original'))){throw 'Removal during preparation must invalidate the job'}
             }elseif($case -eq 'case'){

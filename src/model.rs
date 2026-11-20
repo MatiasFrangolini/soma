@@ -398,7 +398,10 @@ impl Store {
         let directory = plain(fs::canonicalize(directory).map_err(|_| "El checkout no existe")?);
         let settings = self.load()?;
         let source = settings.projects.iter().find(|p| p.directory == directory)
-            .or_else(|| settings.projects.iter().find(|p| crate::git::same_project(&p.directory, &directory)))
+            .or_else(|| {
+                let identity = crate::git::project_identity(&directory)?;
+                settings.projects.iter().find(|p| crate::git::project_identity(&p.directory).as_ref() == Some(&identity))
+            })
             .ok_or("Proyecto no registrado: usá add --path DIRECTORIO")?;
         let mut test = source.test_configs.iter().find(|c| c.id == config)
             .ok_or("Configuración de pruebas no encontrada; agregala en test_configs")?.clone();
@@ -729,16 +732,18 @@ pub fn branch(dir: &Path) -> String {
     "Sin Git / no disponible".into()
 }
 fn ignored(path: &Path, c: &Config, root: &Path) -> bool {
-    let rel = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    if c.input_excludes
-        .iter()
-        .any(|x| rel == *x || rel.starts_with(&format!("{x}/")))
-    {
-        return true;
+    if !c.input_excludes.is_empty() {
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if c.input_excludes
+            .iter()
+            .any(|x| rel == *x || rel.starts_with(&format!("{x}/")))
+        {
+            return true;
+        }
     }
     path.file_name()
         .map(|n| {
@@ -765,62 +770,75 @@ fn ignored(path: &Path, c: &Config, root: &Path) -> bool {
         })
         .unwrap_or(false)
 }
-fn walk(path: &Path, c: &Config, root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+fn walk(path: &Path, metadata: Option<fs::Metadata>, c: &Config, root: &Path, files: &mut Vec<PathBuf>, cacheable: &mut bool) -> Result<()> {
     if ignored(path, c, root) {
         return Ok(());
     }
-    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if meta.file_type().is_symlink() {
+    use std::os::windows::fs::MetadataExt;
+    let meta = match metadata { Some(meta) => meta, None => fs::symlink_metadata(path).map_err(|e| e.to_string())? };
+    if meta.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 { *cacheable = false; }
+    let kind = meta.file_type();
+    if kind.is_symlink() {
         return Err(format!("Entrada symlink no soportada: {}", path.display()));
     }
-    if meta.is_dir() {
+    if kind.is_dir() {
         for item in fs::read_dir(path).map_err(|e| e.to_string())? {
-            walk(&item.map_err(|e| e.to_string())?.path(), c, root, files)?;
+            let item = item.map_err(|e| e.to_string())?;
+            walk(&item.path(), Some(item.metadata().map_err(|e| e.to_string())?), c, root, files, cacheable)?;
         }
-    } else if meta.is_file() {
+    } else if kind.is_file() {
         files.push(path.to_path_buf());
     }
     Ok(())
 }
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut h = Sha256::new();
-    feed_file(path, &mut h)?;
+    feed_file(path, &mut h, &mut [0; 65536])?;
     Ok(format!("{:x}", h.finalize()))
 }
-fn feed_file(path: &Path, h: &mut Sha256) -> Result<u64> {
+fn feed_file(path: &Path, h: &mut Sha256, buffer: &mut [u8]) -> Result<u64> {
     let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut b = [0; 65536];
     let mut bytes = 0;
     loop {
-        let n = f.read(&mut b).map_err(|e| e.to_string())?;
+        let n = f.read(buffer).map_err(|e| e.to_string())?;
         if n == 0 {
             break;
         }
-        h.update(&b[..n]);
+        h.update(&buffer[..n]);
         bytes += n as u64;
     }
     Ok(bytes)
 }
 pub fn fingerprint(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> Result<String> {
-    fingerprint_observed(p, c, env).map(|(key, _)| key)
+    fingerprint_observed(p, c, env, None).map(|(key, ..)| key)
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct FingerprintTimings {
+    #[serde(default)]
+    pub inventory_hit: bool,
     pub scan_ms: u64,
     pub git_ms: u64,
     pub hash_ms: u64,
     pub files: usize,
     pub bytes: u64,
 }
-pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> Result<(String, FingerprintTimings)> {
+pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<String, String>, inventory: Option<&crate::inventory::Inventory>) -> Result<(String, FingerprintTimings, String, Option<String>)> {
     let clock = std::time::Instant::now();
-    let mut files = Vec::new();
-    for input in &c.inputs {
-        walk(&resolve(p, input), c, &p.directory, &mut files)?;
-    }
-    files.sort();
-    files.dedup();
-    let mut observed = FingerprintTimings { scan_ms: clock.elapsed().as_millis() as u64, files: files.len(), ..Default::default() };
+    let scan = || {
+        let mut files = Vec::new();
+        let mut cacheable = true;
+        for input in &c.inputs {
+            walk(&resolve(p, input), None, c, &p.directory, &mut files, &mut cacheable)?;
+        }
+        files.sort();
+        files.dedup();
+        Ok((files, cacheable))
+    };
+    let (files, inventory_hit) = match inventory {
+        Some(index) => index.files(p, c, scan)?,
+        None => (std::sync::Arc::new(scan()?.0), false),
+    };
+    let mut observed = FingerprintTimings { inventory_hit, scan_ms: clock.elapsed().as_millis() as u64, files: files.len(), ..Default::default() };
     let mut h = Sha256::new();
     h.update(p.directory.to_string_lossy().as_bytes());
     let mut build_config = c.clone();
@@ -829,7 +847,9 @@ pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<Strin
     // Build tools may interpolate any environment value. Persist only the digest.
     h.update(serde_json::to_vec(env).unwrap());
     let clock = std::time::Instant::now();
-    h.update(branch(&p.directory));
+    let branch = branch(&p.directory);
+    h.update(&branch);
+    let mut head = None;
     use std::os::windows::process::CommandExt;
     if let Ok(o) = std::process::Command::new("git")
         .args(["-C", &p.directory.to_string_lossy(), "rev-parse", "HEAD"])
@@ -837,22 +857,24 @@ pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<Strin
         .output()
     {
         if o.status.success() {
+            head = Some(String::from_utf8_lossy(&o.stdout).trim().to_owned());
             h.update(o.stdout);
         }
     }
     observed.git_ms = clock.elapsed().as_millis() as u64;
     let clock = std::time::Instant::now();
-    for path in files {
+    let mut buffer = [0u8; 65536];
+    for path in files.iter() {
         h.update(
             path.strip_prefix(&p.directory)
-                .unwrap_or(&path)
+                .unwrap_or(path)
                 .to_string_lossy()
                 .as_bytes(),
         );
         h.update([0]);
-        observed.bytes += feed_file(&path, &mut h)?;
+        observed.bytes += feed_file(path, &mut h, &mut buffer)?;
         h.update([0]);
     }
     observed.hash_ms = clock.elapsed().as_millis() as u64;
-    Ok((format!("{:x}", h.finalize()), observed))
+    Ok((format!("{:x}", h.finalize()), observed, branch, head))
 }

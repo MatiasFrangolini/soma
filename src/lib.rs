@@ -1,3 +1,6 @@
+mod inventory;
+pub mod resources;
+mod job_signal;
 pub mod cli;
 pub mod engine;
 pub mod git;

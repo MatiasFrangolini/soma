@@ -85,6 +85,9 @@ fn terminal(state: &str) -> bool {
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Timings {
     pub preparation_ms: Option<u64>,
+    pub worker_wait_ms: Option<u64>,
+    pub checkout_wait_ms: Option<u64>,
+    pub verification_ms: Option<u64>,
     pub soma_queue_ms: Option<u64>,
     pub resource_wait_ms: Option<u64>,
     pub adapter_and_maven_ms: Option<u64>,
@@ -126,6 +129,8 @@ pub struct Record {
     pub forced: bool,
     pub error: Option<String>,
     pub timings: Timings,
+    #[serde(default)]
+    pub resource_usage: Option<crate::resources::TreeUsage>,
     pub evidence: Evidence,
 }
 #[derive(Clone, Deserialize)]
@@ -139,6 +144,8 @@ pub struct Request {
 }
 #[derive(Clone)]
 struct Plan {
+    branch: String,
+    head: Option<String>,
     project: Project,
     modules: Vec<PathBuf>,
     environment: BTreeMap<String, String>,
@@ -160,17 +167,32 @@ pub struct MavenRequest {
     pub event_token: String,
 }
 struct Entry {
+    signals: Option<crate::job_signal::Signals>,
     record: Record,
     request: Option<Request>,
     plan: Option<Plan>,
     participants: BTreeSet<String>,
     cancel: Arc<AtomicBool>,
     accepted: Instant,
+    checkout_elapsed: Duration,
+    blocked_since: Option<Instant>,
+    retry_at: Option<Instant>,
     prepared: Option<Instant>,
     adapter_started: Option<Instant>,
     maven_started: Option<Instant>,
     event_token: String,
     runner: Option<Arc<Engine>>,
+}
+impl Entry {
+    fn notify(&mut self) {
+        if let Some(signals) = &self.signals {
+            if self.record.state != "preparing" { signals.prepared.set(); }
+            if terminal(&self.record.state) {
+                signals.finished.set();
+                self.signals = None;
+            }
+        }
+    }
 }
 struct State {
     entries: BTreeMap<String, Entry>,
@@ -179,13 +201,37 @@ struct State {
     active_checkouts: BTreeSet<PathBuf>,
     closing: bool,
     history_error: Option<String>,
+    archive: Option<crate::job_history::Archive>,
+}
+impl State {
+    fn account_checkout_wait(&mut self) {
+        let now = Instant::now();
+        let mut claimed = self.active_checkouts.clone();
+        for id in &self.ready {
+            let Some(entry) = self.entries.get_mut(id) else { continue };
+            let first_free = claimed.insert(entry.record.directory.clone());
+            if !first_free || entry.retry_at.is_some() {
+                entry.blocked_since.get_or_insert(now);
+            } else if let Some(start) = entry.blocked_since.take() {
+                entry.checkout_elapsed += now.duration_since(start);
+            }
+        }
+    }
 }
 pub struct Jobs {
+    inventory: crate::inventory::Inventory,
     store: Store,
     state: Mutex<State>,
     changed: Condvar,
     preparing: AtomicBool,
     concurrency: usize,
+}
+pub(crate) fn split_property(args: &[String]) -> Option<Value> {
+    args.windows(2).find(|pair| {
+        pair[0].strip_prefix("-D").is_some_and(|key| !key.is_empty() && !key.contains('='))
+            && pair[1].strip_prefix('.').and_then(|s| s.split_once('=')).is_some_and(|(key, _)|
+                !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.-".contains(&b)))
+    }).map(|_| json!({"ok":false,"code":"split_maven_property","error":"Una propiedad -D llegó en dos argumentos. Pasá la propiedad completa como un elemento del array Maven."}))
 }
 fn safe_args(args: &[String]) -> Vec<String> {
     let mut property = false;
@@ -310,7 +356,7 @@ fn validate_reactor(directory: &Path) -> Result<Vec<PathBuf>> {
         .map(|pom| model::plain(pom.parent().unwrap().to_path_buf()))
         .collect())
 }
-fn plan(store: &Store, request: &Request) -> Result<Plan> {
+fn plan(store: &Store, request: &Request, inventory: &crate::inventory::Inventory) -> Result<Plan> {
     let mut observed = PlanTimings::default();
     if !matches!(request.kind.as_str(), "test" | "build") {
         return Err("kind debe ser test o build".into());
@@ -376,7 +422,7 @@ fn plan(store: &Store, request: &Request) -> Result<Plan> {
     let wrapper_digest = if Path::new(&wrapper).is_file() { Some(model::hash_file(Path::new(&wrapper))?) } else { None };
     observed.adapter_ms = ms(clock);
     let mut digest = Sha256::new();
-    let (fingerprint, timings) = model::fingerprint_observed(&project, &config, &environment)?;
+    let (fingerprint, timings, branch, head) = model::fingerprint_observed(&project, &config, &environment, Some(inventory))?;
     observed.fingerprint = timings;
     digest.update(fingerprint);
     digest.update(&request.kind);
@@ -386,6 +432,7 @@ fn plan(store: &Store, request: &Request) -> Result<Plan> {
         digest.update(digest_value);
     }
     Ok(Plan {
+        branch, head,
         project,
         modules,
         environment,
@@ -401,30 +448,36 @@ impl Jobs {
     pub fn new(store: Store) -> Result<Arc<Self>> {
         let concurrency = store.load()?.job_concurrency;
         fs::create_dir_all(store.home.join("jobs")).map_err(|e| e.to_string())?;
+        let archive = crate::job_history::Archive::open(&store).and_then(|mut archive| { archive.prune()?; Ok(archive) });
+        let mut recovered = Vec::new();
+        let mut residues = Vec::new();
         let mut state = State {
             entries: BTreeMap::new(),
             preparing: VecDeque::new(),
             ready: VecDeque::new(),
             active_checkouts: BTreeSet::new(),
             closing: false,
-            history_error: crate::job_history::Archive::open(&store).and_then(|mut history| history.prune()).err(),
+            history_error: archive.as_ref().err().cloned(),
+            archive: archive.ok(),
         };
         for directory in fs::read_dir(store.home.join("jobs"))
             .map_err(|e| e.to_string())?
             .flatten()
-            .take(1000)
         {
             let id = directory.file_name().to_string_lossy().into_owned();
             if !valid_id(&id) {
                 continue;
             }
+            if state.entries.len() >= 1000 { break; }
             let Ok(mut record) = read_json::<Record>(&directory.path().join("result.json")) else {
+                if residues.len() < 1000 { residues.push(directory.path()); }
                 continue;
             };
             if record.job_id != id {
                 continue;
             }
             if !terminal(&record.state) {
+                recovered.push(id.clone());
                 record.state = "interrupted".into();
                 record.finished_at_ms = Some(utc_ms());
                 record.error =
@@ -434,12 +487,16 @@ impl Jobs {
             state.entries.insert(
                 id,
                 Entry {
+                    signals: None,
                     record,
                     request: None,
                     plan: None,
                     participants: BTreeSet::new(),
                     cancel: Arc::new(AtomicBool::new(false)),
                     accepted: Instant::now(),
+                    checkout_elapsed: Duration::ZERO,
+                    blocked_since: None,
+                    retry_at: None,
                     prepared: None,
                     adapter_started: None,
                     maven_started: None,
@@ -449,6 +506,7 @@ impl Jobs {
             );
         }
         let jobs = Arc::new(Self {
+            inventory: Default::default(),
             store,
             state: Mutex::new(state),
             changed: Condvar::new(),
@@ -457,10 +515,24 @@ impl Jobs {
         });
         {
             let mut state = jobs.state.lock().unwrap();
-            for entry in state.entries.values() {
-                jobs.persist(&entry.record)?;
+            for id in recovered {
+                jobs.persist(&state.entries[&id].record)?;
             }
             jobs.prune(&mut state, LOG_BUDGET);
+        }
+        if !residues.is_empty() {
+            let own = jobs.clone();
+            std::thread::spawn(move || {
+                for batch in residues.chunks(8) {
+                    let state = own.state.lock().unwrap();
+                    let state = own.changed.wait_while(state, |s| !s.closing &&
+                        (!s.active_checkouts.is_empty() || s.entries.values().any(|e| !terminal(&e.record.state)))).unwrap();
+                    if state.closing { return; }
+                    drop(state);
+                    for path in batch { reconcile_empty_job(path); }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            });
         }
         let own = jobs.clone();
         std::thread::spawn(move || own.prepare_loop());
@@ -493,6 +565,7 @@ impl Jobs {
                     entry.record.state = "failed".into();
                 }
             }
+            entry.notify();
         }
     }
     fn finish(&self, id: &str, state_name: &str, error: Option<String>) {
@@ -512,6 +585,7 @@ impl Jobs {
         self.changed.notify_all();
     }
     pub fn submit(&self, request: Request) -> Value {
+        if let Some(error) = split_property(&request.args) { return error; }
         let mut state = self.state.lock().unwrap();
         if state.closing {
             return crate::error("Soma se está cerrando");
@@ -555,6 +629,7 @@ impl Jobs {
             forced: false,
             error: None,
             timings: Timings::default(),
+            resource_usage: None,
             evidence: Evidence::default(),
         };
         if let Err(error) = self.persist(&record) {
@@ -563,13 +638,17 @@ impl Jobs {
         state.entries.insert(
             id.clone(),
             Entry {
+                signals: crate::job_signal::Signals::new(&id),
                 record,
                 request: Some(request),
                 plan: None,
                 participants: BTreeSet::from([participant.clone()]),
                 cancel: Arc::new(AtomicBool::new(false)),
                 accepted: Instant::now(),
-                prepared: None,
+                checkout_elapsed: Duration::ZERO,
+                    blocked_since: None,
+                    retry_at: None,
+                    prepared: None,
                 adapter_started: None,
                 maven_started: None,
                 event_token: identity("event"),
@@ -591,6 +670,9 @@ impl Jobs {
         )
     }
     pub fn status(&self, id: &str) -> Value {
+        self.observe(id, None)
+    }
+    pub fn observe(&self, id: &str, until: Option<&str>) -> Value {
         let state = self.state.lock().unwrap();
         let Some(canonical) = Self::resolve(&state, id) else {
             drop(state);
@@ -600,6 +682,10 @@ impl Jobs {
             drop(state);
             return Self::offline(&self.store, id, None);
         };
+        if (until == Some("finished") && !terminal(&entry.record.state))
+            || (until == Some("prepared") && entry.record.state == "preparing") {
+            return json!({"ok":true,"pending":true,"job_id":canonical,"signal":entry.signals.is_some()});
+        }
         let wait_reason = match entry.record.state.as_str() {
             "queued" if state.active_checkouts.contains(&entry.record.directory) => Some("checkout_in_use"),
             "queued" => Some("soma_queue"),
@@ -610,12 +696,20 @@ impl Jobs {
         json!({"ok":true,"job_id":canonical,"requested_job_id":id,"job":entry.record,"wait_reason":wait_reason,
             "history_error":state.history_error,"participants":entry.participants.len(),"worker_pid":entry.runner.as_ref().and_then(|r|r.status().worker_pid)})
     }
-    pub fn list(&self, summary: bool) -> Value {
+    pub fn list(&self, request: &Value) -> Value {
+        let summary = request["summary"] == true;
         let state = self.state.lock().unwrap();
-        let records = state
+        let mut selected: Vec<_> = state
             .entries
             .values()
             .filter(|e| e.record.canonical_job_id.is_none())
+            .filter(|e| request["path"].as_str().is_none_or(|path| e.record.directory.to_string_lossy().to_lowercase() == path))
+            .filter(|e| request["states"].as_str().is_none_or(|states| states.split(',').any(|s| s == e.record.state)))
+            .collect();
+        selected.sort_by(|a,b| b.record.created_at_ms.cmp(&a.record.created_at_ms).then_with(|| a.record.job_id.cmp(&b.record.job_id)));
+        let matched = selected.len();
+        if let Some(limit) = request["limit"].as_u64() { selected.truncate(limit.min(usize::MAX as u64) as usize); }
+        let records = selected.into_iter()
             .map(|e| {
                 if summary {
                     let mut value = crate::job_output::compact(&json!(e.record));
@@ -627,7 +721,7 @@ impl Jobs {
                 "created_at_ms":e.record.created_at_ms,"participants":e.participants.len()}) }
             })
             .collect::<Vec<_>>();
-        json!({"ok":true,"jobs":records,"concurrency":self.concurrency,"retained_limit":HISTORY,"log_budget_bytes":LOG_BUDGET,"history_error":state.history_error})
+        json!({"ok":true,"filtered_matched":matched,"jobs":records,"concurrency":self.concurrency,"retained_limit":HISTORY,"log_budget_bytes":LOG_BUDGET,"history_error":state.history_error})
     }
     pub fn release(&self, id: &str, participant: &str) -> Value {
         let mut state = self.state.lock().unwrap();
@@ -645,7 +739,7 @@ impl Jobs {
         let remaining = entry.participants.len();
         if remaining == 0 && !terminal(&entry.record.state) {
             entry.cancel.store(true, Ordering::SeqCst);
-            if matches!(entry.record.state.as_str(), "preparing" | "queued") {
+            if entry.record.state == "preparing" || entry.plan.is_some() {
                 entry.record.state = "cancelled".into();
                 entry.record.finished_at_ms = Some(utc_ms());
                 entry.record.timings.total_ms = Some(ms(entry.accepted));
@@ -656,6 +750,7 @@ impl Jobs {
             }
         }
         let _ = self.persist(&entry.record);
+        entry.notify();
         self.prune(&mut state, LOG_BUDGET);
         self.changed.notify_all();
         json!({"ok":true,"job_id":canonical,"participants":remaining})
@@ -663,12 +758,12 @@ impl Jobs {
     pub fn shutdown(&self) {
         let mut state = self.state.lock().unwrap();
         state.closing = true;
-        let ids = state.entries.keys().cloned().collect::<Vec<_>>();
+        let ids = state.entries.iter().filter(|(_, e)| !terminal(&e.record.state)).map(|(id, _)| id.clone()).collect::<Vec<_>>();
         for id in ids {
             self.update(&mut state, &id, |entry| {
                 if !terminal(&entry.record.state) {
                     entry.cancel.store(true, Ordering::SeqCst);
-                    if matches!(entry.record.state.as_str(), "preparing" | "queued") {
+                    if entry.record.state == "preparing" || entry.plan.is_some() {
                         entry.record.state = "cancelled".into();
                         entry.record.finished_at_ms = Some(utc_ms());
                         entry.record.timings.total_ms = Some(ms(entry.accepted));
@@ -711,7 +806,7 @@ impl Jobs {
                 (id, request, entry.cancel.clone())
             };
             let clock = Instant::now();
-            let prepared = plan(&self.store, &request);
+            let prepared = plan(&self.store, &request, &self.inventory);
             if cancel.load(Ordering::SeqCst) {
                 self.finish(&id, "cancelled", None);
             } else {
@@ -778,8 +873,8 @@ impl Jobs {
                                 entry.record.state = "queued".into();
                                 entry.record.project = plan.project.id.clone();
                                 entry.record.directory = plan.project.directory.clone();
-                                entry.record.branch = Some(model::branch(&plan.project.directory));
-                                entry.record.head = crate::git::head(&plan.project.directory);
+                                entry.record.branch = Some(plan.branch.clone());
+                                entry.record.head = plan.head.clone();
                                 entry.record.fingerprint = Some(plan.key.clone());
                                 entry.record.adapter_digest = Some(plan.adapter_digest.clone());
                                 entry.record.requested_maven_args = safe_args(&plan.args);
@@ -800,30 +895,55 @@ impl Jobs {
     }
     fn execute_loop(self: Arc<Self>) {
         loop {
-            let (id, plan, request, cancel) = {
+            let (id, plan, request, cancel, lease) = {
                 let mut state = self.state.lock().unwrap();
                 loop {
                     if state.closing { return; }
-                    let position = state.ready.iter().position(|id| match state.entries.get(id) {
-                        None => true,
-                        Some(entry) if terminal(&entry.record.state) => true,
-                        Some(entry) => entry.plan.as_ref().is_none_or(|plan|
-                            !state.active_checkouts.contains(&plan.project.directory)),
+                    let mut seen = BTreeSet::new();
+                    let now = Instant::now();
+                    let mut wake = None;
+                    let position = state.ready.iter().position(|id| {
+                        let Some(entry) = state.entries.get(id) else { return false };
+                        let path = &entry.record.directory;
+                        if !seen.insert(path) || state.active_checkouts.contains(path) { return false; }
+                        if let Some(retry) = entry.retry_at.filter(|at| *at > now) {
+                            wake = Some(wake.map_or(retry, |old: Instant| old.min(retry)));
+                            return false;
+                        }
+                        true
                     });
                     let Some(position) = position else {
-                        state = self.changed.wait(state).unwrap();
+                        state = match wake {
+                            Some(at) => self.changed.wait_timeout(state, at.saturating_duration_since(Instant::now())).unwrap().0,
+                            None => self.changed.wait(state).unwrap(),
+                        };
                         continue;
                     };
-                    let id = state.ready.remove(position).unwrap();
-                    let Some(entry) = state.entries.get_mut(&id) else { continue };
-                    if terminal(&entry.record.state) { continue; }
-                    let (Some(plan), Some(request)) = (entry.plan.take(), entry.request.clone()) else { continue };
+                    let id = state.ready[position].clone();
+                    let entry = state.entries.get_mut(&id).unwrap();
+                    let lease = crate::git::CheckoutLease::acquire(&entry.record.directory);
+                    if matches!(&lease, Err(e) if e.starts_with("checkout_busy:")) {
+                        let first = entry.retry_at.is_none();
+                        let since = *entry.blocked_since.get_or_insert(now);
+                        let delay = (now.duration_since(since) + Duration::from_millis(100)).min(Duration::from_secs(1));
+                        entry.retry_at = Some(now + delay);
+                        if first {
+                            self.update(&mut state, &id, |e| e.record.state = "waiting_checkout".into());
+                        }
+                        continue;
+                    }
+                    let checkout_ms = entry.checkout_elapsed.as_millis() as u64 + entry.blocked_since.map(ms).unwrap_or(0);
+                    entry.record.timings.checkout_wait_ms = Some(checkout_ms);
+                    entry.record.timings.worker_wait_ms = entry.prepared.map(|at| ms(at).saturating_sub(checkout_ms));
+                    let plan = entry.plan.take().expect("queued job has a plan");
+                    let request = entry.request.clone().expect("queued job has a request");
                     let cancel = entry.cancel.clone();
+                    state.ready.remove(position);
                     state.active_checkouts.insert(plan.project.directory.clone());
-                    break (id, plan, request, cancel);
+                    break (id, plan, request, cancel, lease);
                 }
             };
-            let result = self.execute(&id, &plan, &request, &cancel);
+            let result = lease.and_then(|_lease| self.execute(&id, &plan, &request, &cancel));
             match result {
                 Ok((code, evidence, changed)) => {
                     {
@@ -865,6 +985,7 @@ impl Jobs {
             }
             let mut state = self.state.lock().unwrap();
             state.active_checkouts.remove(&plan.project.directory);
+            state.account_checkout_wait();
             self.changed.notify_all();
         }
     }
@@ -875,27 +996,15 @@ impl Jobs {
         request: &Request,
         cancel: &Arc<AtomicBool>,
     ) -> Result<(u32, Evidence, bool)> {
-        let _lease = loop {
-            if cancel.load(Ordering::SeqCst) {
-                return Err("Trabajo cancelado antes de iniciar Maven".into());
-            }
-            match crate::git::CheckoutLease::acquire(&plan.project.directory) {
-                Ok(lease) => break lease,
-                Err(error) if error.starts_with("checkout_busy:") => {
-                    let mut state = self.state.lock().unwrap();
-                    self.update(&mut state, id, |entry| {
-                        entry.record.state = "waiting_checkout".into();
-                    });
-                    drop(state);
-                    std::thread::sleep(Duration::from_millis(150));
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        let verified = crate::jobs::plan(&self.store, request)?;
+        if cancel.load(Ordering::SeqCst) { return Err("Trabajo cancelado antes de iniciar Maven".into()); }
+        let verification = Instant::now();
+        let verified = crate::jobs::plan(&self.store, request, &self.inventory)?;
         {
             let mut state = self.state.lock().unwrap();
-            self.update(&mut state, id, |entry| entry.record.timings.pre_execution = Some(verified.observed));
+            self.update(&mut state, id, |entry| {
+                entry.record.timings.verification_ms = Some(ms(verification));
+                entry.record.timings.pre_execution = Some(verified.observed);
+            });
         }
         if verified.key != plan.key {
             return Err("invalidated: las entradas cambiaron mientras el trabajo esperaba".into());
@@ -970,6 +1079,10 @@ impl Jobs {
         {
             let mut state = self.state.lock().unwrap();
             self.update(&mut state, id, |entry| {
+                entry.record.resource_usage = runner.status().resource_usage.pop().map(|mut usage| {
+                    usage.phase = request.kind.clone();
+                    usage
+                });
                 entry.record.timings.adapter_and_maven_ms = Some(ms(clock));
                 entry.record.timings.maven_ms = entry.maven_started.map(ms);
             });
@@ -997,7 +1110,7 @@ impl Jobs {
             }
         }
         let collection_ms = ms(clock);
-        let verified = crate::jobs::plan(&self.store, request);
+        let verified = crate::jobs::plan(&self.store, request, &self.inventory);
         let changed = verified.as_ref().map(|p| p.key != plan.key).unwrap_or(true);
         {
             let mut state = self.state.lock().unwrap();
@@ -1047,12 +1160,13 @@ impl Jobs {
         aliases.sort();
         let needs_history = retry_history || aliases.len() > ALIASES
             || state.entries.values().filter(|e| terminal(&e.record.state) && e.record.canonical_job_id.is_none()).count() > HISTORY;
-        let mut history = if needs_history {
-            match crate::job_history::Archive::open(&self.store).and_then(|mut history| { history.prune()?; Ok(history) }) {
-                Ok(history) => Some(history),
-                Err(error) => { state.history_error = Some(error); None }
+        if needs_history && (retry_history || state.archive.is_none()) {
+            match crate::job_history::Archive::open(&self.store) {
+                Ok(history) => state.archive = Some(history),
+                Err(error) => { state.history_error = Some(error); state.archive = None; }
             }
-        } else { None };
+        }
+        let history = &mut state.archive;
         for (_, id) in aliases.iter().take(aliases.len().saturating_sub(ALIASES)) {
             let Some(history) = history.as_mut() else { break; };
             if let Some(entry) = state.entries.get(id) {
@@ -1113,6 +1227,7 @@ impl Jobs {
                 .get(id)
                 .is_some_and(|e| !terminal(&e.record.state))
         });
+        state.account_checkout_wait();
     }
     fn remove_files(&self, id: &str, metadata: bool) {
         if !valid_id(id) {
@@ -1169,7 +1284,9 @@ impl Jobs {
     pub fn offline_list(store: &Store) -> Value {
         let mut records = Vec::new();
         if let Ok(entries) = fs::read_dir(store.home.join("jobs")) {
-            for entry in entries.flatten().take(1000) {
+            for entry in entries.flatten() {
+                if records.len() >= 1000 { break; }
+                if !entry.path().join("result.json").is_file() { continue; }
                 let id = entry.file_name().to_string_lossy().into_owned();
                 if !valid_id(&id) {
                     continue;
@@ -1193,6 +1310,29 @@ impl Jobs {
     }
     pub fn offline_logs(store: &Store, id: &str, request: &Value) -> Value {
         job_logs(store, Self::offline(store, id, None), request)
+    }
+}
+// Old stores may contain a directory with only an empty observation journal.
+fn reconcile_empty_job(dir: &Path) {
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+    fn contains_only(dir: &Path, name: &str) -> bool {
+        let Ok(meta) = fs::symlink_metadata(dir) else { return false };
+        if !meta.is_dir() || meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 { return false; }
+        let Ok(mut entries) = fs::read_dir(dir) else { return false };
+        matches!(entries.next(), Some(Ok(e)) if e.file_name() == name) && entries.next().is_none()
+    }
+    let logs = dir.join("logs");
+    if !contains_only(dir, "logs") || !contains_only(&logs, "observations.json") { return; }
+    let path = logs.join("observations.json");
+    let Ok(meta) = fs::symlink_metadata(&path) else { return };
+    if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || meta.len() > 1024 { return; }
+    if let Ok(journal) = read_json::<Value>(&path) {
+        if journal["operations"].as_array().is_some_and(Vec::is_empty) && journal["base"] == 0
+            && journal["stream"].is_string() && fs::remove_file(path).is_ok() {
+            let _ = fs::remove_dir(logs);
+            let _ = fs::remove_dir(dir);
+        }
     }
 }
 fn log_size(directory: &Path) -> u64 {

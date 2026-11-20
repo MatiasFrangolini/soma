@@ -90,7 +90,7 @@ fn status(store: &Store, id: &str) -> Value {
     call(store, &json!({"command":"job_status","job":id}), false)
         .unwrap_or_else(|e| if e.is_absent() { Jobs::offline(store, id, None) } else { e.response() })
 }
-fn outcome(response: Value) -> Value {
+pub(crate) fn outcome(response: Value) -> Value {
     if response["ok"] != true {
         return response;
     }
@@ -101,27 +101,45 @@ fn outcome(response: Value) -> Value {
         None => response,
     }
 }
-fn wait(store: &Store, id: &str, timeout: u64) -> Value {
-    let deadline = Instant::now() + Duration::from_secs(timeout);
+fn observe_until(store: &Store, id: &str, phase: &str, deadline: Instant, summary: bool) -> Value {
+    let mut backoff = Duration::from_millis(100);
     loop {
-        let response = status(store, id);
-        if response["ok"] != true {
-            return response;
+        let request = json!({"command":"job_status", "job":id, "until":phase,"summary":summary});
+        let value = call(store, &request, false).unwrap_or_else(|e|
+            if e.is_absent() { Jobs::offline(store, id, None) } else { e.response() });
+        let state = value["job"]["state"].as_str();
+        // An older owner returns the full record and ignores the extra field.
+        let pending = value["pending"] == true || (value["historical"] != true &&
+            state.is_some_and(|state| if phase == "prepared" { state == "preparing" }
+                else { matches!(state,"preparing"|"queued"|"waiting_checkout"|"waiting_resources"|"running"|"cancelling") }));
+        if !pending || value["ok"] != true { return value; }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() { return status(store, id); }
+        if value["signal"] == true {
+            let job = value["job_id"].as_str().unwrap_or(id);
+            let owner = value["owner"]["pid"].as_u64().unwrap_or(0);
+            if crate::job_signal::wait(owner, job, phase, remaining.min(Duration::from_secs(5))) { continue; }
         }
-        if response["owner_unavailable"] == true {
-            return json!({"ok":false,"code":"interrupted","error":"El dueño no está disponible; el resultado final no fue registrado","job":response["job"]});
-        }
-        if matches!(
-            response["job"]["state"].as_str(),
-            Some("completed" | "failed" | "cancelled" | "invalidated" | "interrupted")
-        ) {
-            return outcome(response);
-        }
-        if Instant::now() >= deadline {
-            return json!({"ok":false,"code":"timeout","job_id":response["job_id"],"error":"La espera terminó; la participación y el trabajo siguen activos","job":response["job"]});
-        }
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(remaining.min(backoff));
+        backoff = (backoff * 2).min(Duration::from_secs(1));
     }
+}
+fn wait(store: &Store, id: &str, timeout: u64, summary: bool) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    let response = observe_until(store, id, "finished", deadline, summary);
+    if response["ok"] != true || response["verdict"].is_string() {
+        return response;
+    }
+    if response["owner_unavailable"] == true {
+        return json!({"ok":false,"code":"interrupted","error":"El dueño no está disponible; el resultado final no fue registrado","job":response["job"]});
+    }
+    if matches!(
+        response["job"]["state"].as_str(),
+        Some("completed" | "failed" | "cancelled" | "invalidated" | "interrupted")
+    ) {
+        return outcome(response);
+    }
+    json!({"ok":false,"code":"timeout","job_id":response["job_id"],"error":"La espera terminó; la participación y el trabajo siguen activos","job":response["job"]})
 }
 pub fn run(store: &Store, args: &[String]) -> Value {
     let response = execute(store, args);
@@ -139,11 +157,13 @@ fn execute(store: &Store, args: &[String]) -> Value {
         .unwrap_or(600)
         .clamp(1, 3600);
     let operation = options.first().map(String::as_str).unwrap_or("list");
+    let summary = options.iter().any(|arg| arg == "--summary");
     let id = flag(options, "--job").unwrap_or_default();
     match operation {
         "submit" => {
             let Some(directory) = flag(options, "--path") else { return crate::error("Falta --path del checkout exacto"); };
             let maven_args = args.get(split+1..).unwrap_or_default();
+            if let Some(error) = crate::jobs::split_property(maven_args) { return error; }
             let request = json!({"command":"job_submit","request":{
                 "directory":directory,"config":flag(options,"--config").unwrap_or_else(||"tests".into()),
                 "kind":flag(options,"--kind").unwrap_or_else(||"test".into()),"args":maven_args}});
@@ -151,11 +171,7 @@ fn execute(store: &Store, args: &[String]) -> Value {
             if submitted["ok"] != true { return submitted; }
             let Some(requested) = submitted["job_id"].as_str() else { return crate::error("Falta identidad de trabajo"); };
             let deadline = Instant::now() + Duration::from_secs(timeout);
-            let prepared = loop {
-                let value = status(store, requested);
-                if value["ok"] != true || value["job"]["state"] != "preparing" || Instant::now() >= deadline { break value; }
-                std::thread::sleep(Duration::from_millis(100));
-            };
+            let prepared = observe_until(store, requested, "prepared", deadline, false);
             if prepared["ok"] != true {
                 let mut result = prepared;
                 result["accepted_job_id"] = submitted["job_id"].clone();
@@ -164,7 +180,7 @@ fn execute(store: &Store, args: &[String]) -> Value {
             }
             if options.iter().any(|a|a == "--wait") {
                 let canonical = prepared["job_id"].as_str().unwrap_or(requested);
-                let mut result = wait(store, canonical, timeout);
+                let mut result = wait(store, canonical, timeout, summary);
                 result["job_id"] = canonical.into();
                 result["participant_id"] = submitted["participant_id"].clone();
                 return result;
@@ -179,8 +195,9 @@ fn execute(store: &Store, args: &[String]) -> Value {
                 "participant_id":submitted["participant_id"],"deduplicated":prepared["job_id"].as_str().is_some_and(|id|id!=requested),
                 "state":prepared["job"]["state"]})
         }
-        "status" if !id.is_empty() => status(store, &id),
-        "wait" if !id.is_empty() => wait(store, &id, timeout),
+        "status" if !id.is_empty() => call(store, &json!({"command":"job_status","job":id,"summary":summary}), false)
+            .unwrap_or_else(|e| if e.is_absent() { Jobs::offline(store, &id, None) } else { e.response() }),
+        "wait" if !id.is_empty() => wait(store, &id, timeout, summary),
         "logs" if !id.is_empty() => {
             let request = json!({"command":"job_logs","job":id,
                 "tail":flag(options,"--tail").and_then(|s|s.parse::<u64>().ok()),
@@ -219,7 +236,18 @@ fn execute(store: &Store, args: &[String]) -> Value {
 fn list(store: &Store, options: &[String]) -> Value {
     let summary = options.iter().any(|arg| arg == "--summary");
     let history = options.iter().any(|arg| arg == "--history");
-    let mut response = call(store,&json!({"command":"job_list","summary":summary}),false)
+    let maximum = (crate::job_history::LIMIT + crate::jobs::HISTORY + crate::jobs::PENDING) as u64;
+    let limit = flag(options,"--limit").and_then(|n| n.parse::<u64>().ok()).unwrap_or(maximum).min(maximum) as usize;
+    let path = if let Some(directory) = flag(options, "--path") {
+        let path = std::path::Path::new(&directory);
+        let absolute = std::fs::canonicalize(path).or_else(|_| std::path::absolute(path));
+        let path = match absolute { Ok(path) => crate::model::plain(path).to_string_lossy().to_lowercase(),
+            Err(_) => return crate::error("No se pudo resolver --path") };
+        Some(path)
+    } else { None };
+    let query = json!({"command":"job_list","summary":summary,"states":flag(options,"--state"),
+        "path":path,"limit":(!history).then_some(limit)});
+    let mut response = call(store,&query,false)
         .unwrap_or_else(|e| if e.is_absent() { Jobs::offline_list(store) } else { e.response() });
     if response["ok"] != true { return response; }
     let mut jobs = response["jobs"].as_array().cloned().unwrap_or_default();
@@ -243,11 +271,7 @@ fn list(store: &Store, options: &[String]) -> Value {
         response["archive_max_bytes"] = json!(crate::job_history::BYTES);
         response["archive_max_age_days"] = json!(30);
     }
-    if let Some(directory) = flag(options, "--path") {
-        let path = std::path::Path::new(&directory);
-        let absolute = std::fs::canonicalize(path).or_else(|_| std::path::absolute(path));
-        let path = match absolute { Ok(path) => crate::model::plain(path).to_string_lossy().to_lowercase(),
-            Err(_) => return crate::error("No se pudo resolver --path") };
+    if let Some(path) = path {
         jobs.retain(|job| job["directory"].as_str().is_some_and(|directory| directory.to_lowercase() == path));
     }
     if let Some(states) = flag(options, "--state") {
@@ -255,9 +279,8 @@ fn list(store: &Store, options: &[String]) -> Value {
     }
     jobs.sort_by(|a,b| b["created_at_ms"].as_u64().cmp(&a["created_at_ms"].as_u64())
         .then_with(|| a["job_id"].as_str().cmp(&b["job_id"].as_str())));
-    let matched = jobs.len();
-    let maximum = (crate::job_history::LIMIT + crate::jobs::HISTORY + crate::jobs::PENDING) as u64;
-    let limit = flag(options,"--limit").and_then(|n| n.parse::<u64>().ok()).unwrap_or(maximum).min(maximum) as usize;
+    let matched = if history { jobs.len() } else { response["filtered_matched"].as_u64().map_or(jobs.len(),|n| n as usize) };
+    response.as_object_mut().unwrap().remove("filtered_matched");
     jobs.truncate(limit);
     if summary {
         jobs = jobs.into_iter().map(|job| {

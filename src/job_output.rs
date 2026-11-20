@@ -70,6 +70,7 @@ pub(crate) fn compact(job: &Value) -> Value {
         "exit_code",
         "forced",
         "error",
+        "resource_usage",
         "timings",
     ] {
         value[key] = job[key].clone();
@@ -85,6 +86,9 @@ pub(crate) fn compact(job: &Value) -> Value {
         "total_ms",
         "preparation_ms",
         "soma_queue_ms",
+        "checkout_wait_ms",
+        "worker_wait_ms",
+        "verification_ms",
         "resource_wait_ms",
         "maven_ms",
         "evidence_ms",
@@ -110,6 +114,10 @@ pub(crate) fn compact(job: &Value) -> Value {
             "message":message.chars().take(240).collect::<String>()})
         })
         .unwrap_or(Value::Null);
+    if verdict == "failed" && job["evidence"]["details"].as_array().is_some_and(|details|
+        details.iter().any(|d| d["message"].as_str().is_some_and(|m| m.contains("Could not find a valid Docker environment")))) {
+        value["next_action"] = json!("check_docker_provider");
+    }
     let args = job["requested_maven_args"]
         .as_array()
         .cloned()

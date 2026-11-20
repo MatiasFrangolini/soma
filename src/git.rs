@@ -33,21 +33,15 @@ pub fn same_project(base: &Path, candidate: &Path) -> bool {
     if base == candidate {
         return true;
     }
-    let (Some(a), Some(b)) = (root(base), root(candidate)) else {
-        return false;
-    };
-    if base.strip_prefix(&a).ok() != candidate.strip_prefix(&b).ok() {
-        return false;
-    }
-    let common = |p: &Path| {
-        invoke(
-            p,
-            &["rev-parse", "--path-format=absolute", "--git-common-dir"],
-        )
-        .ok()
-        .and_then(|s| std::fs::canonicalize(s.trim()).ok())
-    };
-    common(base).is_some_and(|value| Some(value) == common(candidate))
+    project_identity(base).is_some_and(|base| Some(base) == project_identity(candidate))
+}
+
+pub(crate) fn project_identity(dir: &Path) -> Option<(PathBuf, PathBuf)> {
+    let output = invoke(dir, &["rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir"]).ok()?;
+    let mut lines = output.lines();
+    let root = crate::model::plain(std::fs::canonicalize(lines.next()?).ok()?);
+    let common = crate::model::plain(std::fs::canonicalize(lines.next()?).ok()?);
+    Some((common, dir.strip_prefix(root).ok()?.to_path_buf()))
 }
 
 #[derive(Clone, Serialize)]

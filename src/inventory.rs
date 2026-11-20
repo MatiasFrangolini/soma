@@ -158,9 +158,6 @@ impl Entry {
             // The walk starts with the configured spelling, even on a
             // case-insensitive volume. Its children use on-disk long names.
             let start = Path::new(configured);
-            if crate::model::ignored_relative(start, &self.excludes) {
-                return false;
-            }
             if tail.as_os_str().is_empty() {
                 return true;
             }
@@ -215,6 +212,7 @@ impl Inventory {
         &self,
         p: &Project,
         c: &Config,
+        previous_roots: &[PathBuf],
         scan: impl FnOnce() -> crate::model::ScanResult,
     ) -> Result<Selection> {
         {
@@ -233,19 +231,26 @@ impl Inventory {
                 cache.remove(index);
             }
         }
-        self.scan(p, c, false, scan)
+        self.scan(p, c, previous_roots, scan)
     }
 
     pub fn scan(
         &self,
         p: &Project,
         c: &Config,
-        previous_change: bool,
+        previous_roots: &[PathBuf],
         scan: impl FnOnce() -> crate::model::ScanResult,
     ) -> Result<Selection> {
         let entry = Entry::new(p, c);
         let (files, cacheable) = scan().map_err(|error| {
-            error.explain(previous_change || entry.as_ref().is_some_and(|entry| !entry.current()))
+            error.explain(|path| {
+                previous_roots.iter().any(|root| root == path)
+                    || entry.as_ref().is_some_and(|entry| {
+                        entry.input_names.iter().any(|(configured, names)| {
+                            names.is_some() && entry.path.join(configured) == path
+                        })
+                    })
+            })
         })?;
         let files = Arc::new(files);
         let witness = entry.filter(|_| cacheable).map(|mut entry| {

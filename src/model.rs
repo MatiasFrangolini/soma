@@ -770,13 +770,13 @@ pub(crate) fn ignored_relative(path: &Path, excludes: &[String]) -> bool {
         .unwrap_or(false)
 }
 pub(crate) enum ScanError {
-    InitialLookup(std::io::Error),
+    InitialLookup(PathBuf, std::io::Error),
     ObservedEntry(std::io::Error),
 }
 impl ScanError {
-    pub(crate) fn explain(self, changed: bool) -> String {
+    pub(crate) fn explain(self, was_present: impl FnOnce(&Path) -> bool) -> String {
         let (observed, error) = match self {
-            Self::InitialLookup(error) => (changed, error),
+            Self::InitialLookup(path, error) => (was_present(&path), error),
             Self::ObservedEntry(error) => (true, error),
         };
         if observed && matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) {
@@ -786,11 +786,11 @@ impl ScanError {
 }
 pub(crate) type ScanResult = std::result::Result<(Vec<PathBuf>, bool), ScanError>;
 fn walk(path: &Path, metadata: Option<fs::Metadata>, c: &Config, root: &Path, files: &mut Vec<PathBuf>, cacheable: &mut bool) -> std::result::Result<(), ScanError> {
-    if metadata.is_none() && ignored(path, c, root) {
-        return Ok(());
-    }
     use std::os::windows::fs::MetadataExt;
-    let meta = match metadata { Some(meta) => meta, None => fs::symlink_metadata(path).map_err(ScanError::InitialLookup)? };
+    let meta = match metadata {
+        Some(meta) => meta,
+        None => fs::symlink_metadata(path).map_err(|error| ScanError::InitialLookup(path.to_owned(), error))?,
+    };
     if meta.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 { *cacheable = false; }
     let kind = meta.file_type();
     if kind.is_symlink() {
@@ -828,7 +828,10 @@ fn feed_file(path: &Path, h: &mut Sha256, buffer: &mut [u8]) -> std::io::Result<
     Ok(bytes)
 }
 pub fn fingerprint(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> Result<String> {
-    fingerprint_observed(p, c, env, None).map(|(key, ..)| key)
+    fingerprint_observed(p, c, env, None, &input_roots(p,c), &[]).map(|(key, ..)| key)
+}
+pub(crate) fn input_roots(p: &Project, c: &Config) -> Vec<PathBuf> {
+    c.inputs.iter().map(|s| resolve(p,s)).filter(|path| !ignored(path,c,&p.directory)).collect()
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct FingerprintTimings {
@@ -840,21 +843,21 @@ pub struct FingerprintTimings {
     pub files: usize,
     pub bytes: u64,
 }
-pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<String, String>, inventory: Option<&crate::inventory::Inventory>) -> Result<(String, FingerprintTimings, String, Option<String>)> {
+pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<String, String>, inventory: Option<&crate::inventory::Inventory>, roots: &[PathBuf], previous_roots: &[PathBuf]) -> Result<(String, FingerprintTimings, String, Option<String>)> {
     let clock = std::time::Instant::now();
     let scan = || {
         let mut files = Vec::new();
         let mut cacheable = true;
-        for input in &c.inputs {
-            walk(&resolve(p, input), None, c, &p.directory, &mut files, &mut cacheable)?;
+        for root in roots {
+            walk(root, None, c, &p.directory, &mut files, &mut cacheable)?;
         }
         files.sort();
         files.dedup();
         Ok((files, cacheable))
     };
     let mut files = match inventory {
-        Some(index) => index.files(p, c, scan)?,
-        None => crate::inventory::Selection::uncached(scan().map_err(|e| e.explain(false))?.0),
+        Some(index) => index.files(p, c, previous_roots, scan)?,
+        None => crate::inventory::Selection::uncached(scan().map_err(|e| e.explain(|path| previous_roots.iter().any(|root| root == path)))?.0),
     };
     let mut observed = FingerprintTimings { inventory_hit: files.hit, scan_ms: clock.elapsed().as_millis() as u64, files: files.names.len(), ..Default::default() };
     let mut h = Sha256::new();
@@ -906,7 +909,7 @@ pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<Strin
         }
         if let Some(index) = inventory.filter(|_| attempt == 0) {
             let clock = std::time::Instant::now();
-            let fresh = index.scan(p, c, true, scan)?;
+            let fresh = index.scan(p, c, roots, scan)?;
             observed.scan_ms += clock.elapsed().as_millis() as u64;
             if fresh.names == files.names && fresh.observed() {
                 files = fresh;

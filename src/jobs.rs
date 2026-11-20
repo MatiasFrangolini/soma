@@ -148,6 +148,7 @@ struct Plan {
     branch: String,
     head: Option<String>,
     project: Project,
+    input_roots: Vec<PathBuf>,
     modules: Vec<PathBuf>,
     environment: BTreeMap<String, String>,
     wrapper: String,
@@ -358,7 +359,7 @@ fn validate_reactor(directory: &Path) -> Result<Vec<PathBuf>> {
         .map(|pom| model::plain(pom.parent().unwrap().to_path_buf()))
         .collect())
 }
-fn plan(store: &Store, request: &Request, inventory: &crate::inventory::Inventory) -> Result<Plan> {
+fn plan(store: &Store, request: &Request, inventory: &crate::inventory::Inventory, previous_roots: &[PathBuf]) -> Result<Plan> {
     let mut observed = PlanTimings::default();
     if !matches!(request.kind.as_str(), "test" | "build") {
         return Err("kind debe ser test o build".into());
@@ -424,7 +425,8 @@ fn plan(store: &Store, request: &Request, inventory: &crate::inventory::Inventor
     let wrapper_digest = if Path::new(&wrapper).is_file() { Some(model::hash_file(Path::new(&wrapper))?) } else { None };
     observed.adapter_ms = ms(clock);
     let mut digest = Sha256::new();
-    let (fingerprint, timings, branch, head) = model::fingerprint_observed(&project, &config, &environment, Some(inventory))?;
+    let input_roots = model::input_roots(&project, &config);
+    let (fingerprint, timings, branch, head) = model::fingerprint_observed(&project, &config, &environment, Some(inventory), &input_roots, previous_roots)?;
     observed.fingerprint = timings;
     digest.update(fingerprint);
     digest.update(&request.kind);
@@ -435,6 +437,7 @@ fn plan(store: &Store, request: &Request, inventory: &crate::inventory::Inventor
     }
     Ok(Plan {
         branch, head,
+        input_roots,
         project,
         modules,
         environment,
@@ -810,7 +813,7 @@ impl Jobs {
                 (id, request, entry.cancel.clone())
             };
             let clock = Instant::now();
-            let prepared = plan(&self.store, &request, &self.inventory);
+            let prepared = plan(&self.store, &request, &self.inventory, &[]);
             if cancel.load(Ordering::SeqCst) {
                 self.finish(&id, "cancelled", None);
             } else {
@@ -1010,7 +1013,7 @@ impl Jobs {
     ) -> Result<(u32, Evidence, bool)> {
         if cancel.load(Ordering::SeqCst) { return Err("Trabajo cancelado antes de iniciar Maven".into()); }
         let verification = Instant::now();
-        let verified = crate::jobs::plan(&self.store, request, &self.inventory)?;
+        let verified = crate::jobs::plan(&self.store, request, &self.inventory, &plan.input_roots)?;
         {
             let mut state = self.state.lock().unwrap();
             self.update(&mut state, id, |entry| {
@@ -1122,7 +1125,7 @@ impl Jobs {
             }
         }
         let collection_ms = ms(clock);
-        let verified = crate::jobs::plan(&self.store, request, &self.inventory);
+        let verified = crate::jobs::plan(&self.store, request, &self.inventory, &plan.input_roots);
         let changed = verified.as_ref().map(|p| p.key != plan.key).unwrap_or(true);
         {
             let mut state = self.state.lock().unwrap();

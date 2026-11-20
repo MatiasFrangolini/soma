@@ -63,6 +63,12 @@ pub fn name(store: &Store) -> String {
     let h = Sha256::digest(store.home.to_string_lossy().to_ascii_lowercase().as_bytes());
     format!("\\\\.\\pipe\\Soma-{:x}", h)[..41].to_string()
 }
+// Value's Display writes individual JSON tokens. Batch the frame before crossing the pipe.
+fn write_frame(pipe: &mut File, value: &Value) -> std::io::Result<()> {
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    pipe.write_all(&bytes)
+}
 pub fn request(store: &Store, request: &Value) -> Result<Value, RequestError> {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
     let mut pipe = loop {
@@ -77,8 +83,7 @@ pub fn request(store: &Store, request: &Value) -> Result<Value, RequestError> {
             }),
         }
     };
-    writeln!(pipe, "{request}")?;
-    pipe.flush()?;
+    write_frame(&mut pipe, request)?;
     let mut result = String::new();
     BufReader::new(pipe)
         .take(16 * 1024 * 1024)
@@ -179,8 +184,7 @@ pub(crate) fn serve(engine: Arc<Engine>, jobs: Arc<crate::jobs::Jobs>, control: 
                 Err(_) => crate::error("No se pudo leer la solicitud"),
             };
             let mut file = reader.into_inner();
-            let _ = writeln!(file, "{response}");
-            let _ = file.flush();
+            let _ = write_frame(&mut file, &response);
             let raw = file.into_raw_handle();
             FlushFileBuffers(raw);
             DisconnectNamedPipe(raw);
@@ -195,8 +199,17 @@ fn dispatch(engine: &Arc<Engine>, jobs: &Arc<crate::jobs::Jobs>, r: &Value) -> V
             Ok(request) => jobs.submit(request),
             Err(_) => crate::error("Solicitud de trabajo inválida"),
         },
-        "job_status" => jobs.status(r["job"].as_str().unwrap_or("")),
-        "job_list" => jobs.list(r["summary"] == true),
+        "job_status" => {
+            let result = jobs.observe(r["job"].as_str().unwrap_or(""), r["until"].as_str());
+            if r["summary"] == true && result["job"].is_object()
+                && !(r["until"] == "finished" && result["owner_unavailable"] == true) {
+                let result = if r["until"] == "finished" {
+                    crate::job_output::outcome(result)
+                } else { result };
+                crate::job_output::summary(result)
+            } else { result }
+        },
+        "job_list" => jobs.list(r),
         "job_release" => jobs.release(r["job"].as_str().unwrap_or(""), r["participant"].as_str().unwrap_or("")),
         "job_logs" => jobs.logs(r["job"].as_str().unwrap_or(""), r),
         "job_started" => jobs.started(r["job"].as_str().unwrap_or(""), r["token"].as_str().unwrap_or(""),

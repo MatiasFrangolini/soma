@@ -112,20 +112,20 @@ struct Entry {
     id: String,
     size: u64,
     finished: u64,
-    expired: bool,
+
 }
 
 /// A maintenance batch reads the archive once, then reserves space before
 /// retiring any detailed result. Failed eviction never discards newer evidence.
-pub(crate) struct Archive<'a> {
-    store: &'a Store,
+pub(crate) struct Archive {
+    store: Store,
     entries: Vec<Entry>,
     bytes: u64,
 }
-impl<'a> Archive<'a> {
-    pub(crate) fn open(store: &'a Store) -> Result<Self> {
+impl Archive {
+    pub(crate) fn open(store: &Store) -> Result<Self> {
         let mut archive = Self {
-            store,
+            store: store.clone(),
             entries: Vec::new(),
             bytes: 0,
         };
@@ -137,7 +137,7 @@ impl<'a> Archive<'a> {
                         id,
                         size,
                         finished: record.finished_at_ms.unwrap(),
-                        expired: expired(&record),
+
                     });
                 }
                 Err(ReadError::Missing) => {}
@@ -147,10 +147,12 @@ impl<'a> Archive<'a> {
         archive
             .entries
             .sort_by(|a, b| a.finished.cmp(&b.finished).then_with(|| a.id.cmp(&b.id)));
+        archive.reserve(LIMIT, BYTES)?;
         Ok(archive)
     }
     fn reserve(&mut self, count: usize, bytes: u64) -> Result<()> {
-        while self.entries.first().is_some_and(|entry| entry.expired)
+        let now = crate::observation::timestamp();
+        while self.entries.first().is_some_and(|entry| now.saturating_sub(entry.finished) > AGE_MS)
             || self.entries.len() > count
             || self.bytes > bytes
         {
@@ -158,7 +160,7 @@ impl<'a> Archive<'a> {
                 .entries
                 .first()
                 .ok_or("No se pudo liberar espacio para metadata")?;
-            match fs::remove_file(path(self.store, &entry.id)) {
+            match fs::remove_file(path(&self.store, &entry.id)) {
                 Ok(()) => {},
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {},
                 Err(error) => return Err(format!("No se pudo retirar metadata antigua; se conservó la evidencia detallada: {error}")),
@@ -167,9 +169,6 @@ impl<'a> Archive<'a> {
             self.entries.remove(0);
         }
         Ok(())
-    }
-    pub(crate) fn prune(&mut self) -> Result<()> {
-        self.reserve(LIMIT, BYTES)
     }
 
     pub(crate) fn retain(&mut self, record: &Record) -> Result<()> {
@@ -181,8 +180,15 @@ impl<'a> Archive<'a> {
         }
         // Final results are immutable. This also tolerates a prior detailed-file
         // removal that was delayed by a Windows sharing violation.
-        if self.entries.iter().any(|entry| entry.id == record.job_id) {
-            return Ok(());
+        if let Some(index) = self.entries.iter().position(|entry| entry.id == record.job_id) {
+            // Verify the archived copy before giving up the last detailed receipt.
+            match load(&self.store, &record.job_id) {
+                Ok(_) => return Ok(()),
+                Err(ReadError::Missing) => {
+                    self.bytes = self.bytes.saturating_sub(self.entries.remove(index).size);
+                }
+                Err(error) => return Err(error.message()),
+            }
         }
         let mut metadata = record.clone();
         metadata.evidence.details_truncated |=
@@ -196,7 +202,7 @@ impl<'a> Archive<'a> {
         self.reserve(LIMIT - 1, BYTES - bytes.len() as u64)?;
         fs::create_dir_all(self.store.home.join("job-history"))
             .map_err(|error| error.to_string())?;
-        let target = path(self.store, &record.job_id);
+        let target = path(&self.store, &record.job_id);
         let temporary = target.with_extension("tmp");
         fs::write(&temporary, &bytes).map_err(|error| error.to_string())?;
         if let Err(error) = fs::rename(&temporary, &target) {
@@ -208,7 +214,7 @@ impl<'a> Archive<'a> {
             id: record.job_id.clone(),
             size: bytes.len() as u64,
             finished: record.finished_at_ms.unwrap(),
-            expired: false,
+
         });
         self.entries
             .sort_by(|a, b| a.finished.cmp(&b.finished).then_with(|| a.id.cmp(&b.id)));

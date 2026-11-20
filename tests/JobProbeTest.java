@@ -11,7 +11,14 @@ class JobProbeTest {
         String mode = System.getProperty("probe.mode", "pass");
         if (mode.equals("sleep")) Thread.sleep(12000);
         if (mode.equals("hang")) Thread.sleep(120000);
-        if (mode.equals("mutate")) Files.writeString(Path.of("input.txt"), "changed during test");
+        if (mode.equals("mutate")) {
+            Path input = Path.of("input.txt");
+            var modified = Files.getLastModifiedTime(input);
+            byte[] bytes = Files.readAllBytes(input);
+            bytes[0] ^= 1;
+            Files.write(input, bytes);
+            Files.setLastModifiedTime(input, modified);
+        }
         if (mode.equals("spam")) {
             String line = "bounded job log ñ ".repeat(400);
             for (int i = 0; i < 550; i++) System.out.println(line);

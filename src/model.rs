@@ -398,7 +398,10 @@ impl Store {
         let directory = plain(fs::canonicalize(directory).map_err(|_| "El checkout no existe")?);
         let settings = self.load()?;
         let source = settings.projects.iter().find(|p| p.directory == directory)
-            .or_else(|| settings.projects.iter().find(|p| crate::git::same_project(&p.directory, &directory)))
+            .or_else(|| {
+                let identity = crate::git::project_identity(&directory)?;
+                settings.projects.iter().find(|p| crate::git::project_identity(&p.directory).as_ref() == Some(&identity))
+            })
             .ok_or("Proyecto no registrado: usá add --path DIRECTORIO")?;
         let mut test = source.test_configs.iter().find(|c| c.id == config)
             .ok_or("Configuración de pruebas no encontrada; agregala en test_configs")?.clone();
@@ -728,17 +731,18 @@ pub fn branch(dir: &Path) -> String {
     }
     "Sin Git / no disponible".into()
 }
-fn ignored(path: &Path, c: &Config, root: &Path) -> bool {
-    let rel = path
-        .strip_prefix(root)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .replace('\\', "/");
-    if c.input_excludes
-        .iter()
-        .any(|x| rel == *x || rel.starts_with(&format!("{x}/")))
-    {
-        return true;
+pub(crate) fn ignored(path: &Path, c: &Config, root: &Path) -> bool {
+    ignored_relative(path.strip_prefix(root).unwrap_or(path), &c.input_excludes)
+}
+pub(crate) fn ignored_relative(path: &Path, excludes: &[String]) -> bool {
+    if !excludes.is_empty() {
+        let rel = path.to_string_lossy().replace('\\', "/");
+        if excludes
+            .iter()
+            .any(|x| rel == *x || rel.starts_with(&format!("{x}/")))
+        {
+            return true;
+        }
     }
     path.file_name()
         .map(|n| {
@@ -765,62 +769,97 @@ fn ignored(path: &Path, c: &Config, root: &Path) -> bool {
         })
         .unwrap_or(false)
 }
-fn walk(path: &Path, c: &Config, root: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
-    if ignored(path, c, root) {
-        return Ok(());
+pub(crate) enum ScanError {
+    InitialLookup(PathBuf, std::io::Error),
+    ObservedEntry(std::io::Error),
+}
+impl ScanError {
+    pub(crate) fn explain(self, was_present: impl FnOnce(&Path) -> bool) -> String {
+        let (observed, error) = match self {
+            Self::InitialLookup(path, error) => (was_present(&path), error),
+            Self::ObservedEntry(error) => (true, error),
+        };
+        if observed && matches!(error.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory) {
+            format!("invalidated: desapareció una entrada durante la enumeración: {error}")
+        } else { error.to_string() }
     }
-    let meta = fs::symlink_metadata(path).map_err(|e| e.to_string())?;
-    if meta.file_type().is_symlink() {
-        return Err(format!("Entrada symlink no soportada: {}", path.display()));
+}
+pub(crate) type ScanResult = std::result::Result<(Vec<PathBuf>, bool), ScanError>;
+fn walk(path: &Path, metadata: Option<fs::Metadata>, c: &Config, root: &Path, files: &mut Vec<PathBuf>, cacheable: &mut bool) -> std::result::Result<(), ScanError> {
+    use std::os::windows::fs::MetadataExt;
+    let meta = match metadata {
+        Some(meta) => meta,
+        None => fs::symlink_metadata(path).map_err(|error| ScanError::InitialLookup(path.to_owned(), error))?,
+    };
+    if meta.file_attributes() & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT != 0 { *cacheable = false; }
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        return Err(ScanError::ObservedEntry(std::io::Error::other(format!("Entrada symlink no soportada: {}", path.display()))));
     }
-    if meta.is_dir() {
-        for item in fs::read_dir(path).map_err(|e| e.to_string())? {
-            walk(&item.map_err(|e| e.to_string())?.path(), c, root, files)?;
+    if kind.is_dir() {
+        for item in fs::read_dir(path).map_err(ScanError::ObservedEntry)? {
+            let item = item.map_err(ScanError::ObservedEntry)?;
+            let child = item.path();
+            if !ignored(&child, c, root) {
+                walk(&child, Some(item.metadata().map_err(ScanError::ObservedEntry)?), c, root, files, cacheable)?;
+            }
         }
-    } else if meta.is_file() {
+    } else if kind.is_file() {
         files.push(path.to_path_buf());
     }
     Ok(())
 }
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut h = Sha256::new();
-    feed_file(path, &mut h)?;
+    feed_file(path, &mut h, &mut [0; 65536]).map_err(|e| e.to_string())?;
     Ok(format!("{:x}", h.finalize()))
 }
-fn feed_file(path: &Path, h: &mut Sha256) -> Result<u64> {
-    let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
-    let mut b = [0; 65536];
+fn feed_file(path: &Path, h: &mut Sha256, buffer: &mut [u8]) -> std::io::Result<u64> {
+    let mut f = fs::File::open(path)?;
     let mut bytes = 0;
     loop {
-        let n = f.read(&mut b).map_err(|e| e.to_string())?;
+        let n = f.read(buffer)?;
         if n == 0 {
             break;
         }
-        h.update(&b[..n]);
+        h.update(&buffer[..n]);
         bytes += n as u64;
     }
     Ok(bytes)
 }
 pub fn fingerprint(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> Result<String> {
-    fingerprint_observed(p, c, env).map(|(key, _)| key)
+    fingerprint_observed(p, c, env, None, &input_roots(p,c), &[]).map(|(key, ..)| key)
+}
+pub(crate) fn input_roots(p: &Project, c: &Config) -> Vec<PathBuf> {
+    c.inputs.iter().map(|s| resolve(p,s)).filter(|path| !ignored(path,c,&p.directory)).collect()
 }
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct FingerprintTimings {
+    #[serde(default)]
+    pub inventory_hit: bool,
     pub scan_ms: u64,
     pub git_ms: u64,
     pub hash_ms: u64,
     pub files: usize,
     pub bytes: u64,
 }
-pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<String, String>) -> Result<(String, FingerprintTimings)> {
+pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<String, String>, inventory: Option<&crate::inventory::Inventory>, roots: &[PathBuf], previous_roots: &[PathBuf]) -> Result<(String, FingerprintTimings, String, Option<String>)> {
     let clock = std::time::Instant::now();
-    let mut files = Vec::new();
-    for input in &c.inputs {
-        walk(&resolve(p, input), c, &p.directory, &mut files)?;
-    }
-    files.sort();
-    files.dedup();
-    let mut observed = FingerprintTimings { scan_ms: clock.elapsed().as_millis() as u64, files: files.len(), ..Default::default() };
+    let scan = || {
+        let mut files = Vec::new();
+        let mut cacheable = true;
+        for root in roots {
+            walk(root, None, c, &p.directory, &mut files, &mut cacheable)?;
+        }
+        files.sort();
+        files.dedup();
+        Ok((files, cacheable))
+    };
+    let mut files = match inventory {
+        Some(index) => index.files(p, c, previous_roots, scan)?,
+        None => crate::inventory::Selection::uncached(scan().map_err(|e| e.explain(|path| previous_roots.iter().any(|root| root == path)))?.0),
+    };
+    let mut observed = FingerprintTimings { inventory_hit: files.hit, scan_ms: clock.elapsed().as_millis() as u64, files: files.names.len(), ..Default::default() };
     let mut h = Sha256::new();
     h.update(p.directory.to_string_lossy().as_bytes());
     let mut build_config = c.clone();
@@ -828,31 +867,56 @@ pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<Strin
     h.update(serde_json::to_vec(&build_config).unwrap());
     // Build tools may interpolate any environment value. Persist only the digest.
     h.update(serde_json::to_vec(env).unwrap());
-    let clock = std::time::Instant::now();
-    h.update(branch(&p.directory));
-    use std::os::windows::process::CommandExt;
-    if let Ok(o) = std::process::Command::new("git")
-        .args(["-C", &p.directory.to_string_lossy(), "rev-parse", "HEAD"])
-        .creation_flags(0x08000000)
-        .output()
-    {
-        if o.status.success() {
-            h.update(o.stdout);
+    let prefix = h;
+    for attempt in 0..2 {
+        let mut h = prefix.clone();
+        let clock = std::time::Instant::now();
+        let branch = branch(&p.directory);
+        h.update(&branch);
+        let mut head = None;
+        use std::os::windows::process::CommandExt;
+        if let Ok(o) = std::process::Command::new("git")
+            .args(["-C", &p.directory.to_string_lossy(), "rev-parse", "HEAD"])
+            .creation_flags(0x08000000)
+            .output()
+        {
+            if o.status.success() {
+                head = Some(String::from_utf8_lossy(&o.stdout).trim().to_owned());
+                h.update(o.stdout);
+            }
         }
+        observed.git_ms += clock.elapsed().as_millis() as u64;
+        let clock = std::time::Instant::now();
+        let mut buffer = [0u8; 65536];
+        for path in files.names.iter() {
+            h.update(
+                path.strip_prefix(&p.directory)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .as_bytes(),
+            );
+            h.update([0]);
+            observed.bytes += feed_file(path, &mut h, &mut buffer).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound || files.changed() {
+                    format!("invalidated: cambió una entrada durante la lectura: {error}")
+                } else { error.to_string() }
+            })?;
+            h.update([0]);
+        }
+        observed.hash_ms += clock.elapsed().as_millis() as u64;
+        if !files.changed() {
+            return Ok((format!("{:x}", h.finalize()), observed, branch, head));
+        }
+        if let Some(index) = inventory.filter(|_| attempt == 0) {
+            let clock = std::time::Instant::now();
+            let fresh = index.scan(p, c, roots, scan)?;
+            observed.scan_ms += clock.elapsed().as_millis() as u64;
+            if fresh.names == files.names && fresh.observed() {
+                files = fresh;
+                continue;
+            }
+        }
+        break;
     }
-    observed.git_ms = clock.elapsed().as_millis() as u64;
-    let clock = std::time::Instant::now();
-    for path in files {
-        h.update(
-            path.strip_prefix(&p.directory)
-                .unwrap_or(&path)
-                .to_string_lossy()
-                .as_bytes(),
-        );
-        h.update([0]);
-        observed.bytes += feed_file(&path, &mut h)?;
-        h.update([0]);
-    }
-    observed.hash_ms = clock.elapsed().as_millis() as u64;
-    Ok((format!("{:x}", h.finalize()), observed))
+    Err("invalidated: las entradas cambiaron durante la verificación".into())
 }

@@ -41,6 +41,7 @@ pub struct Status {
     pub project: Option<String>,
     pub config: Option<String>,
     pub phase: String,
+    pub resource_usage: Vec<crate::resources::TreeUsage>,
     pub worker_pid: Option<u32>,
     pub exit_code: Option<u32>,
     pub error: Option<String>,
@@ -60,6 +61,7 @@ impl Default for Status {
             project: None,
             config: None,
             phase: "".into(),
+            resource_usage: Vec::new(),
             worker_pid: None,
             exit_code: None,
             error: None,
@@ -488,6 +490,7 @@ impl Engine {
         if cancel.load(Ordering::SeqCst) {
             return Ok(0);
         }
+        let mut snapshot_digest = None;
         if mode == "reuse" && needs_stamp {
             let stamp: Stamp = fs::read(&stamp_path)
                 .ok()
@@ -499,7 +502,11 @@ impl Engine {
                 );
             }
             if let Some(artifact) = &stamp.artifact {
-                if model::hash_file(Path::new(artifact)).ok() != stamp.artifact_hash {
+                let snapshot = matches!(&c.run, RunSpec::JavaJar { artifact: configured, snapshot: true, .. }
+                    if model::resolve(p, configured) == Path::new(artifact));
+                if snapshot && stamp.artifact_hash.is_some() {
+                    snapshot_digest = stamp.artifact_hash.clone();
+                } else if model::hash_file(Path::new(artifact)).ok() != stamp.artifact_hash {
                     return Err("build_stale: el artefacto cambió o no existe".into());
                 }
             }
@@ -532,6 +539,7 @@ impl Engine {
                     _ => None,
                 };
                 let hash = artifact.as_ref().map(|p| model::hash_file(p)).transpose()?;
+                snapshot_digest = hash.clone();
                 let stamp = Stamp {
                     fingerprint: after,
                     artifact: artifact.map(|p| p.to_string_lossy().into()),
@@ -571,10 +579,11 @@ impl Engine {
                     let copy = directory.join("application.jar");
                     snapshot_file = Some(SnapshotFile(copy.clone()));
                     fs::copy(&path, &copy).map_err(|e| e.to_string())?;
-                    if model::hash_file(&path)? != model::hash_file(&copy)? {
+                    let expected = match snapshot_digest { Some(hash) => hash, None => model::hash_file(&path)? };
+                    if expected != model::hash_file(&copy)? {
                         let _ = fs::remove_file(&copy);
                         let _ = fs::remove_dir(&directory);
-                        return Err("El JAR cambió al preparar la copia de ejecución".into());
+                        return Err("build_stale: el JAR cambió al preparar la copia de ejecución".into());
                     }
                     path = copy.clone();
                     // The runtime lease still protects Git and other application starts.
@@ -704,6 +713,8 @@ impl Engine {
                 })
             })
             .collect::<Vec<_>>();
+        let mut usage = crate::resources::TreeUsage { phase: self.status().phase, ..Default::default() };
+        let mut next_sample = Instant::now();
         let mut stop_at = None;
         let mut forced = false;
         let ready_target = readiness.map(|spec| spec.target()).transpose()?;
@@ -717,6 +728,10 @@ impl Engine {
             }
             if done == WAIT_FAILED {
                 return Err("Falló la espera del proceso".into());
+            }
+            if Instant::now() >= next_sample {
+                usage.sample_memory(worker.job.0 as HANDLE);
+                next_sample = Instant::now() + Duration::from_secs(1);
             }
             if cancel.load(Ordering::SeqCst) && stop_at.is_none() {
                 let _ = writeln!(worker.input, "stop");
@@ -768,6 +783,8 @@ impl Engine {
             WaitForSingleObject(worker.process.0 as HANDLE, 2000);
             GetExitCodeProcess(worker.process.0 as HANDLE, &mut code);
         }
+        usage.accounting(worker.job.0 as HANDLE);
+        self.state.lock().unwrap().resource_usage.push(usage);
         drop(worker);
         for reader in readers {
             let _ = reader.join();

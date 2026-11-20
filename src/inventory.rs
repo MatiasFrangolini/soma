@@ -2,6 +2,7 @@
 mod notifications;
 use crate::model::{Config, Project, Result};
 use notifications::Watch;
+use std::os::windows::ffi::OsStrExt;
 use std::{
     collections::VecDeque,
     fs::{File, OpenOptions},
@@ -25,9 +26,25 @@ fn identity(file: &File) -> Option<(u32, u32, u32)> {
         info.nFileIndexLow,
     ))
 }
+// Directory enumeration returns the long spelling. A notification may use an alias.
+fn entry_names(path: &Path) -> Option<(String, String)> {
+    let native: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut data = WIN32_FIND_DATAW::default();
+    let handle = unsafe { FindFirstFileW(native.as_ptr(), &mut data) };
+    if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+        return None;
+    }
+    unsafe {
+        FindClose(handle);
+    }
+    let decode =
+        |name: &[u16]| String::from_utf16(&name[..name.iter().position(|&c| c == 0)?]).ok();
+    Some((decode(&data.cFileName)?, decode(&data.cAlternateFileName)?))
+}
 struct Entry {
     path: PathBuf,
     inputs: Vec<String>,
+    input_names: Vec<(String, String)>,
     excludes: Vec<String>,
     root: File,
     watch: Mutex<Option<Watch>>,
@@ -79,9 +96,15 @@ impl Entry {
             return None;
         }
         let watch = Watch::new(root.try_clone().ok()?)?;
+        let input_names = c
+            .inputs
+            .iter()
+            .map(|s| entry_names(&p.directory.join(s)))
+            .collect::<Option<Vec<_>>>()?;
         Some(Self {
             path: p.directory.clone(),
             inputs: c.inputs.clone(),
+            input_names,
             excludes: c.input_excludes.clone(),
             root,
             watch: Mutex::new(Some(watch)),
@@ -110,15 +133,52 @@ impl Entry {
             return true;
         }
         let path = Path::new(name);
-        let Some(Component::Normal(first)) = path.components().next() else {
+        let mut parts = path.components();
+        let Some(Component::Normal(first)) = parts.next() else {
             return true;
         };
+        let tail = parts.as_path();
+        if tail.as_os_str().is_empty() {
+            return true;
+        }
         self.inputs
             .iter()
-            .any(|s| first.eq_ignore_ascii_case(s.as_str()))
-            && !path
-                .ancestors()
-                .any(|p| crate::model::ignored_relative(p, &self.excludes))
+            .zip(&self.input_names)
+            .any(|(configured, (long, short))| {
+                if !long.is_ascii()
+                    || !short.is_ascii()
+                    || first.eq_ignore_ascii_case(short.as_str())
+                {
+                    return true;
+                }
+                if !first.eq_ignore_ascii_case(long.as_str()) {
+                    return false;
+                }
+                // The walk starts with the configured spelling, even on a
+                // case-insensitive volume. Its children use on-disk long names.
+                let start = Path::new(configured);
+                if crate::model::ignored_relative(start, &self.excludes) {
+                    return false;
+                }
+                if !start
+                    .join(tail)
+                    .ancestors()
+                    .any(|p| crate::model::ignored_relative(p, &self.excludes))
+                {
+                    return true;
+                }
+                let mut walked = start.to_owned();
+                for part in tail.iter() {
+                    let Some((long, _)) = entry_names(&self.path.join(&walked).join(part)) else {
+                        return true;
+                    };
+                    walked.push(long);
+                    if crate::model::ignored_relative(&walked, &self.excludes) {
+                        return false;
+                    }
+                }
+                true
+            })
     }
 }
 

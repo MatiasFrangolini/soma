@@ -792,14 +792,14 @@ fn walk(path: &Path, metadata: Option<fs::Metadata>, c: &Config, root: &Path, fi
 }
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut h = Sha256::new();
-    feed_file(path, &mut h, &mut [0; 65536])?;
+    feed_file(path, &mut h, &mut [0; 65536]).map_err(|e| e.to_string())?;
     Ok(format!("{:x}", h.finalize()))
 }
-fn feed_file(path: &Path, h: &mut Sha256, buffer: &mut [u8]) -> Result<u64> {
-    let mut f = fs::File::open(path).map_err(|e| e.to_string())?;
+fn feed_file(path: &Path, h: &mut Sha256, buffer: &mut [u8]) -> std::io::Result<u64> {
+    let mut f = fs::File::open(path)?;
     let mut bytes = 0;
     loop {
-        let n = f.read(buffer).map_err(|e| e.to_string())?;
+        let n = f.read(buffer)?;
         if n == 0 {
             break;
         }
@@ -874,7 +874,11 @@ pub(crate) fn fingerprint_observed(p: &Project, c: &Config, env: &BTreeMap<Strin
                     .as_bytes(),
             );
             h.update([0]);
-            observed.bytes += feed_file(path, &mut h, &mut buffer)?;
+            observed.bytes += feed_file(path, &mut h, &mut buffer).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound || files.changed() {
+                    format!("invalidated: cambió una entrada durante la lectura: {error}")
+                } else { error.to_string() }
+            })?;
             h.update([0]);
         }
         observed.hash_ms += clock.elapsed().as_millis() as u64;

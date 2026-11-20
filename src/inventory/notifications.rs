@@ -13,11 +13,12 @@ use windows_sys::Win32::{
 };
 
 // One outstanding read per directory handle. Windows buffers changes between reads.
+type Buffer = [u32; 8192];
 pub(super) struct Watch {
     directory: File,
     event: OwnedHandle,
-    operation: Box<OVERLAPPED>,
-    buffer: Box<[u32; 8192]>,
+    operation: *mut OVERLAPPED,
+    buffer: *mut Buffer,
     pending: bool,
 }
 // The event and pinned allocations outlive each request. Entry serializes access.
@@ -32,27 +33,32 @@ impl Watch {
         let mut watch = Self {
             directory,
             event: unsafe { OwnedHandle::from_raw_handle(event) },
-            operation: Box::default(),
-            buffer: Box::new([0; 8192]),
+            operation: Box::into_raw(Box::default()),
+            buffer: Box::into_raw(Box::new([0; 8192])),
             pending: false,
         };
         watch.arm().then_some(watch)
     }
 
     fn arm(&mut self) -> bool {
-        *self.operation = OVERLAPPED::default();
-        self.operation.hEvent = self.event.as_raw_handle();
+        unsafe {
+            self.operation.write(OVERLAPPED {
+                hEvent: self.event.as_raw_handle(),
+                ..OVERLAPPED::default()
+            })
+        };
+
         self.pending = unsafe {
             ReadDirectoryChangesW(
                 self.directory.as_raw_handle(),
-                self.buffer.as_mut_ptr().cast(),
-                std::mem::size_of_val(&*self.buffer) as u32,
+                self.buffer.cast(),
+                std::mem::size_of::<Buffer>() as u32,
                 1,
                 FILE_NOTIFY_CHANGE_FILE_NAME
                     | FILE_NOTIFY_CHANGE_DIR_NAME
                     | FILE_NOTIFY_CHANGE_ATTRIBUTES,
                 ptr::null_mut(),
-                &mut *self.operation,
+                self.operation,
                 None,
             ) != 0
         };
@@ -68,22 +74,14 @@ impl Watch {
             }
             let mut size = 0;
             if unsafe {
-                GetOverlappedResult(
-                    self.directory.as_raw_handle(),
-                    &*self.operation,
-                    &mut size,
-                    0,
-                )
+                GetOverlappedResult(self.directory.as_raw_handle(), self.operation, &mut size, 0)
             } == 0
             {
                 return unsafe { GetLastError() } == ERROR_IO_INCOMPLETE;
             }
             self.pending = false;
             let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    self.buffer.as_ptr().cast::<u8>(),
-                    std::mem::size_of_val(&*self.buffer),
-                )
+                std::slice::from_raw_parts(self.buffer.cast::<u8>(), std::mem::size_of::<Buffer>())
             };
             let Some(mut records) = bytes.get(..size as usize) else {
                 return false;
@@ -126,9 +124,14 @@ impl Drop for Watch {
     fn drop(&mut self) {
         if self.pending {
             unsafe {
-                CancelIoEx(self.directory.as_raw_handle(), &*self.operation);
-                GetOverlappedResult(self.directory.as_raw_handle(), &*self.operation, &mut 0, 1);
+                CancelIoEx(self.directory.as_raw_handle(), self.operation);
+                GetOverlappedResult(self.directory.as_raw_handle(), self.operation, &mut 0, 1);
             }
+        }
+        // The request has completed. Reclaim the original allocations exactly once.
+        unsafe {
+            drop(Box::from_raw(self.operation));
+            drop(Box::from_raw(self.buffer));
         }
     }
 }
